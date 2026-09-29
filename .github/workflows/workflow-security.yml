@@ -33,3 +33,4 @@ jobs:
         with:
           advanced-security: false
           min-severity: medium
+          config: zizmor.yml

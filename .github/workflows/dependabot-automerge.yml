@@ -30,13 +30,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
+          WF_RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
 
-          if [ "${{ github.event_name }}" = "pull_request_target" ]; then
-            number="${{ github.event.pull_request.number }}"
+          if [ "$EVENT_NAME" = "pull_request_target" ]; then
+            number="$PR_EVENT_NUMBER"
           else
-            branch="${{ github.event.workflow_run.head_branch }}"
+            branch="$WF_RUN_BRANCH"
             number="$(gh pr list \
               --repo "$REPO" \
               --head "$branch" \

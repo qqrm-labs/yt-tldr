@@ -1,0 +1,9 @@
+# zizmor configuration (https://docs.zizmor.sh/configuration/)
+#
+# dependabot-automerge.yml relies on pull_request_target + workflow_run by design:
+# it needs PR context with write permissions to merge Dependabot PRs after CI,
+# and it never checks out PR code — it only talks to the PR via the gh API.
+rules:
+  dangerous-triggers:
+    ignore:
+      - .github/workflows/dependabot-automerge.yml
