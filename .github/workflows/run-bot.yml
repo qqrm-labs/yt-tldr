@@ -1,0 +1,115 @@
+name: Run Bot
+
+on:
+  schedule:
+    # Каждые 5 минут: вычерпать очередь getUpdates. Первая реакция на ссылку — 0-10 минут.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: Process this YouTube video instead of polling Telegram (test)
+        type: string
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: run-bot-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Cache build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Restore persistent state
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=0
+          for attempt in 1 2 3; do
+            if git fetch origin bot-state:refs/remotes/origin/bot-state 2>/dev/null; then
+              ok=1
+              break
+            fi
+            echo "fetch attempt $attempt failed; retrying in 10s" >&2
+            sleep 10
+          done
+          if [[ "$ok" == "1" ]]; then
+            mkdir -p data
+            git archive origin/bot-state data | tar -x
+          elif git ls-remote --exit-code origin refs/heads/bot-state >/dev/null 2>&1; then
+            echo "bot-state exists but could not be fetched; refusing to run with empty dedup state" >&2
+            exit 1
+          else
+            echo "No bot-state branch yet; starting with empty state."
+          fi
+
+      - name: Build bot
+        run: cargo build --release --locked
+
+      - name: Process test video
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.youtube_url != '' }}
+        env:
+          TEST_URL: ${{ inputs.youtube_url }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/yt-tldr process "$TEST_URL" | tee "$GITHUB_STEP_SUMMARY"
+
+      - name: Poll Telegram
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.youtube_url != '') }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+        shell: bash
+        run: ./target/release/yt-tldr poll
+
+      - name: Save state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d data ]]; then
+            echo "No data directory; state was not changed."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          state_dir="$RUNNER_TEMP/yt-tldr-state"
+          if git fetch origin bot-state:refs/remotes/origin/bot-state 2>/dev/null; then
+            git worktree add "$state_dir" origin/bot-state
+          else
+            git worktree add --detach "$state_dir" HEAD
+            git -C "$state_dir" checkout --orphan bot-state
+            git -C "$state_dir" rm -rf . >/dev/null 2>&1 || true
+          fi
+          mkdir -p "$state_dir/data"
+          cp -a data/. "$state_dir/data/"
+          git -C "$state_dir" add data
+          if ! git -C "$state_dir" diff --cached --quiet; then
+            git -C "$state_dir" commit -m "Update bot state"
+            git -C "$state_dir" push origin HEAD:bot-state
+          fi

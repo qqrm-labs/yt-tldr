@@ -1,0 +1,13 @@
+[package]
+name = "yt-tldr"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Telegram bot: throw a YouTube link at it, get back a summary with the key takeaways (GitHub Actions serverless)"
+
+[dependencies]
+anyhow = "1"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
