@@ -6,4 +6,4 @@
 rules:
   dangerous-triggers:
     ignore:
-      - .github/workflows/dependabot-automerge.yml
+      - "**/dependabot-automerge.yml"
