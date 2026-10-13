@@ -34,8 +34,8 @@ fn complete(state: &mut State, update: &Update) {
     state.update_offset = state.update_offset.max(update.update_id.saturating_add(1));
 }
 
-/// Commit progress before acknowledging an update, and persist the prepared
-/// reply before sending so a delivery retry never repeats provider work.
+/// Persist only metadata: Telegram retains the original update until completion.
+/// Resuming a partial reply requires regeneration with an identical fingerprint.
 pub fn process_update(
     state: &mut State,
     update: &Update,
@@ -47,7 +47,7 @@ pub fn process_update(
     if state
         .pending
         .as_ref()
-        .is_some_and(|p| p.update.update_id != update.update_id)
+        .is_some_and(|p| p.update_id != update.update_id)
     {
         bail!("finish the pending update before processing another");
     }
@@ -65,9 +65,10 @@ pub fn process_update(
     }
     if state.pending.is_none() {
         state.pending = Some(Pending {
-            update: update.clone(),
+            update_id: update.update_id,
             attempts: 0,
             chunks: None,
+            reply_hash: None,
             next_chunk: 0,
         });
         checkpoint(state)?;
@@ -87,11 +88,22 @@ pub fn process_update(
                 Err(_) => Some(FAILURE_REPLY.to_string()),
             }
         };
-        state.pending.as_mut().unwrap().chunks = Some(
-            reply
-                .map(|text| crate::telegram::message_chunks(&text))
-                .unwrap_or_default(),
+        let chunks = reply
+            .map(|text| crate::telegram::message_chunks(&text))
+            .unwrap_or_default();
+        let hash = crate::state::fingerprint(&serde_json::to_vec(&chunks)?);
+        let pending = state.pending.as_mut().unwrap();
+        if pending.next_chunk > 0 && pending.reply_hash.as_ref() != Some(&hash) {
+            bail!(
+                "regenerated reply differs after partial delivery; operator reconciliation required"
+            );
+        }
+        anyhow::ensure!(
+            pending.next_chunk <= chunks.len(),
+            "invalid persisted delivery cursor"
         );
+        pending.reply_hash = Some(hash);
+        pending.chunks = Some(chunks);
         checkpoint(state)?;
     }
     loop {
@@ -205,7 +217,7 @@ mod tests {
         assert_eq!(state.update_offset, 2);
     }
     #[test]
-    fn partial_delivery_resumes_only_unsent_chunks_without_provider_calls() {
+    fn partial_delivery_resumes_only_unsent_chunks_after_identical_regeneration() {
         let mut state = State::default();
         let mut sends = 0;
         assert!(
@@ -231,7 +243,7 @@ mod tests {
             &mut state,
             &update(1),
             true,
-            |_| panic!("summary must be reused"),
+            |_| Ok(Some("a".repeat(4000))),
             |_, chunk| {
                 assert_eq!(chunk.len(), 100);
                 Ok(())
@@ -254,6 +266,86 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn changed_reply_after_partial_delivery_fails_before_sending() {
+        let mut state = State::default();
+        let mut sends = 0;
+        assert!(
+            process_update(
+                &mut state,
+                &update(1),
+                true,
+                |_| Ok(Some("a".repeat(4000))),
+                |_, _| {
+                    sends += 1;
+                    if sends == 2 {
+                        bail!("transport failed")
+                    }
+                    Ok(())
+                },
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        state = restored(&state);
+        let error = process_update(
+            &mut state,
+            &update(1),
+            true,
+            |_| Ok(Some("changed".into())),
+            |_, _| panic!("must not mix replies"),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reconciliation"));
+        assert_eq!(state.update_offset, 0);
+        assert_eq!(state.pending.as_ref().unwrap().next_chunk, 1);
+    }
+
+    #[test]
+    fn persisted_state_contains_no_plaintext_message_chat_id_or_reply() {
+        let mut update = update(1);
+        let message = update.message.as_mut().unwrap();
+        message.chat.id = -1009876543210;
+        message.text = Some("private user message".into());
+        let mut state = State::default();
+        assert!(
+            process_update(
+                &mut state,
+                &update,
+                true,
+                |_| Ok(Some("private generated reply".into())),
+                |_, _| bail!("stop before delivery"),
+                |state| {
+                    let json = serde_json::to_string(state)?;
+                    for secret in [
+                        "private user message",
+                        "private generated reply",
+                        "-1009876543210",
+                        "chat",
+                        "text",
+                        "chunks",
+                    ] {
+                        assert!(!json.contains(secret));
+                    }
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        process_update(
+            &mut state,
+            &update,
+            true,
+            |_| panic!("in-memory reply exists"),
+            |_, _| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("-1009876543210"));
+        assert!(!json.contains("private"));
     }
     #[test]
     fn earlier_completed_update_survives_later_failure() {

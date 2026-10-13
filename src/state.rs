@@ -1,13 +1,17 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
 
 #[derive(Serialize, Deserialize)]
 pub struct Pending {
-    pub update: crate::telegram::Update,
+    pub update_id: u64,
     pub attempts: u8,
+    // Replies are process-local only: the state branch is public.
+    #[serde(skip)]
     pub chunks: Option<Vec<String>>,
+    pub reply_hash: Option<String>,
     pub next_chunk: usize,
 }
 
@@ -28,14 +32,19 @@ impl State {
     pub fn load(path: &str) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(raw) => {
-                let state: Self = serde_json::from_str(&raw)?;
+                let mut state: Self = serde_json::from_str(&raw)?;
+                for key in &mut state.processed {
+                    if !key.starts_with("sha256:") {
+                        *key = fingerprint(key.as_bytes());
+                    }
+                }
                 if let Some(pending) = &state.pending {
                     anyhow::ensure!(
-                        pending.next_chunk <= pending.chunks.as_ref().map_or(0, Vec::len),
+                        pending.next_chunk == 0 || pending.reply_hash.is_some(),
                         "invalid delivery cursor in stored state"
                     );
                     anyhow::ensure!(
-                        pending.update.update_id >= state.update_offset,
+                        pending.update_id >= state.update_offset,
                         "pending update precedes stored offset"
                     );
                 }
@@ -47,11 +56,12 @@ impl State {
     }
 
     pub fn is_processed(&self, key: &str) -> bool {
-        self.processed.iter().any(|k| k == key)
+        let hash = fingerprint(key.as_bytes());
+        self.processed.iter().any(|k| k == &hash)
     }
 
     pub fn mark_processed(&mut self, key: &str) {
-        self.processed.push(key.to_string());
+        self.processed.push(fingerprint(key.as_bytes()));
         if self.processed.len() > KEEP_LAST {
             let drop = self.processed.len() - KEEP_LAST;
             self.processed.drain(..drop);
@@ -72,6 +82,10 @@ impl State {
     }
 }
 
+pub fn fingerprint(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,8 +98,10 @@ mod tests {
         std::fs::write(path, r#"{"update_offset":42,"processed":["1:2"]}"#).unwrap();
         let mut state = State::load(path).unwrap();
         assert!(state.pending.is_none());
+        assert!(state.is_processed("1:2"));
         state.update_offset = 43;
         state.save(path).unwrap();
+        assert!(!std::fs::read_to_string(path).unwrap().contains("1:2"));
         assert_eq!(State::load(path).unwrap().update_offset, 43);
     }
     #[test]

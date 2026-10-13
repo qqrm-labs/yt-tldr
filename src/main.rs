@@ -54,15 +54,14 @@ fn poll() -> Result<()> {
             |state| state.save(&cfg.state_path),
         )
     };
-    // The Telegram queue may expire; retain the original pending update locally.
-    if let Some(pending) = state.pending.as_ref() {
-        let update = pending.update.clone();
-        process(&mut state, &update)?;
-    }
     let mut handled = 0;
     while handled < 25 {
         let updates = telegram::get_updates(&cfg, state.update_offset)?;
         if updates.is_empty() {
+            anyhow::ensure!(
+                state.pending.is_none(),
+                "pending update is unavailable from Telegram; operator reconciliation required"
+            );
             break;
         }
         for update in updates.into_iter().take(25 - handled) {
