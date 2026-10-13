@@ -5,6 +5,8 @@ on:
   push:
     branches: [main]
 
+  workflow_dispatch:
+
 permissions:
   contents: read
 
@@ -23,8 +25,9 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache build
@@ -34,10 +37,22 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check
-        run: cargo check --tests
+        run: cargo check --locked --tests
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
+
+  ci-gate:
+    if: always()
+    needs: [checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every CI job to succeed
+        env:
+          RESULT_0: ${{ needs.checks.result }}
+        run: |
+          test "$RESULT_0" = success

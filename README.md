@@ -52,8 +52,7 @@ Telegram-бот: кидаешь ссылку на YouTube — получаешь
 5. `gh workflow run -R qqrm-labs/yt-tldr "Run Bot"` — первый прогон (или дождаться cron).
 6. Кинуть боту ссылку на видео, подождать до ~10 минут (cron + обработка).
 
-Опционально: `ALLOWED_CHAT_IDS` (secret, comma-separated) — белый список чатов, если
-ник бота кому-то стал известен и чужаки начали жечь квоту.
+Обязательно для polling: `ALLOWED_CHAT_IDS` (secret, comma-separated) — явный белый список чатов. Без него бот отказывается обращаться к провайдерам.
 
 ## Локально
 
@@ -77,3 +76,15 @@ cargo run -- setup                            # setMyCommands
 - Webhook через Cloudflare Worker (бесплатно) → мгновенная реакция вместо cron.
 - Long-poll режим: один job на несколько часов → ответ за секунды.
 - Выбор языка саммари командой бота.
+
+## Checkpoint and maintenance guarantees
+
+State files are atomically replaced. Only a confirmed missing file/remote state branch permits bootstrap; unreadable, corrupt, or unreachable state stops the run. The save step only follows a successful restore and refuses to overwrite a state branch that changed during the run. Delivery checkpoints contain metadata only: update ID, retry count, chunk cursor and SHA-256 fingerprints. Message/chat contents and replies are never written to the public state branch. Legacy dedup keys are migrated to hashes on load; existing branch history is not rewritten.
+
+Telegram has no idempotency key: a crash after Telegram accepts a message but before its checkpoint is persisted can still duplicate that message. GitHub runner loss before the final state-branch push can also lose local checkpoints. Exactly-once delivery is not claimed.
+
+Dependabot batches weekly maintenance updates. CI and workflow-security gates require every constituent job to succeed; verified bot commits are matched to the exact checked head before native auto-merge.
+
+Polling requires the `ALLOWED_CHAT_IDS` secret (comma-separated integer chat IDs); malformed or missing allowlists stop polling before paid providers are called. `process <url>` remains independent of Telegram credentials. Transient provider HTTP 408/429/5xx and connection/timeouts retain the update for up to three persisted attempts; failed or exhausted requests produce a generic safe reply. Prepared replies live only in memory. After restart, Telegram must still retain the original update; providers may be called again within the same persisted three-attempt budget. A partial reply resumes only if the regenerated chunk list has the same SHA-256 fingerprint. A mismatch or expired update stops processing for operator reconciliation; processed/offset markers advance only after completion. A Telegram send error retains the unsent tail for a later run.
+
+For a reconciliation error, inspect the already received Telegram messages before changing pending metadata. Decide whether to abandon the remainder or deliberately resend the full reply; there is no automatic reset that can silently duplicate messages. Durable private reply storage is a separate architectural decision.
