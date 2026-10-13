@@ -1,166 +1,54 @@
 name: Dependabot Automerge
 
-on:
-  pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+# workflow_run is intentional: no checkout, artifacts, or PR-controlled execution.
+# The native gates and --match-head-commit bind the write to the checked commit.
+on: # zizmor: ignore[dangerous-triggers]
   workflow_run:
-    workflows: ["CI"]
+    workflows: [CI, Workflow Security]
     types: [completed]
 
+# Metadata only: never check out PR code or consume its artifacts here.
 permissions:
   contents: write
   pull-requests: write
   checks: read
-  statuses: read
 
 concurrency:
-  group: dependabot-automerge-${{ github.event.pull_request.number || github.event.workflow_run.head_branch || github.run_id }}
+  group: dependabot-automerge-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 jobs:
   automerge:
     if: >-
-      github.event_name == 'pull_request_target' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request')
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     steps:
-      - name: Resolve Dependabot pull request
-        id: pr
+      - name: Enable native auto-merge for the checked Dependabot commit
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
-          WF_RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          CHECKED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-
-          if [ "$EVENT_NAME" = "pull_request_target" ]; then
-            number="$PR_EVENT_NUMBER"
-          else
-            branch="$WF_RUN_BRANCH"
-            number="$(gh pr list \
-              --repo "$REPO" \
-              --head "$branch" \
-              --state open \
-              --json number,author \
-              --jq '.[] | select(.author.login == "app/dependabot" or .author.login == "dependabot[bot]") | .number' \
-              | head -n1)"
-          fi
-
-          if [ -z "${number:-}" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          pr="$(jq -r '.workflow_run.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")"
+          if [[ ! "$pr" =~ ^[0-9]+$ ]]; then
+            echo 'No associated pull request; nothing to merge.'
             exit 0
           fi
-
-          author="$(gh pr view "$number" --repo "$REPO" --json author --jq '.author.login')"
-          if [ "$author" != "app/dependabot" ] && [ "$author" != "dependabot[bot]" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          info="$(gh pr view "$pr" --repo "$REPO" --json author,isCrossRepository,headRefOid,baseRefName,isDraft,state,statusCheckRollup)"
+          if ! jq -e --arg sha "$CHECKED_SHA" '
+            (.author.login == "app/dependabot" or .author.login == "dependabot[bot]") and
+            .isCrossRepository == false and .baseRefName == "main" and
+            .state == "OPEN" and .isDraft == false and .headRefOid == $sha and
+            (["ci-gate", "workflow-security-gate"] -
+              [.statusCheckRollup[] | select(.status == "COMPLETED" and .conclusion == "SUCCESS") | .name] | length == 0)
+          ' <<< "$info" >/dev/null; then
+            echo 'The current Dependabot commit has not passed both required gates.'
             exit 0
           fi
-
-          head_sha="$(gh pr view "$number" --repo "$REPO" --json headRefOid --jq '.headRefOid')"
-          echo "number=$number" >> "$GITHUB_OUTPUT"
-          echo "head-sha=$head_sha" >> "$GITHUB_OUTPUT"
-
-      - name: Read Dependabot metadata
-        id: metadata
-        if: steps.pr.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-        run: |
-          set -euo pipefail
-
-          # dependabot/fetch-metadata больше не принимает pull-request-number вне
-          # pull_request-контекста, поэтому semver-уровень берём из стандартных
-          # меток dependabot (semver:major/minor/patch).
-          label="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels \
-            --jq '[.labels[].name | select(startswith("semver:"))][0] // ""')"
-          echo "update-type=version-update:semver-${label#semver:}" >> "$GITHUB_OUTPUT"
-
-      - name: Require patch or minor dependency update
-        id: policy
-        if: steps.pr.outputs.skip != 'true'
-        env:
-          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
-        run: |
-          set -euo pipefail
-
-          case "$UPDATE_TYPE" in
-            version-update:semver-patch|version-update:semver-minor)
-              echo "safe=true" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "safe=false" >> "$GITHUB_OUTPUT"
-              ;;
-          esac
-
-      - name: Require successful checks
-        id: checks
-        if: steps.pr.outputs.skip != 'true' && steps.policy.outputs.safe == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          EXPECTED_HEAD_SHA: ${{ steps.pr.outputs.head-sha }}
-        run: |
-          set -euo pipefail
-
-          for _ in $(seq 1 40); do
-            current_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid')"
-            if [ "$current_head_sha" != "$EXPECTED_HEAD_SHA" ]; then
-              echo "Pull request head changed; waiting for the new CI run."
-              exit 0
-            fi
-
-            state="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup --jq '
-              if (.statusCheckRollup | length) == 0 then
-                "pending"
-              elif ([.statusCheckRollup[] | select((.status != null and .status != "COMPLETED"))] | length) > 0 then
-                "pending"
-              elif ([.statusCheckRollup[] | select((.conclusion != null and (.conclusion != "SUCCESS" and .conclusion != "SKIPPED" and .conclusion != "NEUTRAL")) or (.state != null and .state != "SUCCESS"))] | length) > 0 then
-                "failed"
-              else
-                "passed"
-              end
-            ')"
-
-            case "$state" in
-              passed)
-                echo "passed=true" >> "$GITHUB_OUTPUT"
-                exit 0
-                ;;
-              failed)
-                echo "Checks are not green; leaving the Dependabot PR open."
-                echo "passed=false" >> "$GITHUB_OUTPUT"
-                exit 0
-                ;;
-            esac
-
-            sleep 15
-          done
-
-          echo "Checks did not finish before timeout; leaving the Dependabot PR open."
-          echo "passed=false" >> "$GITHUB_OUTPUT"
-          exit 0
-
-      - name: Merge Dependabot pull request
-        if: steps.pr.outputs.skip != 'true' && steps.policy.outputs.safe == 'true' && steps.checks.outputs.passed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          EXPECTED_HEAD_SHA: ${{ steps.pr.outputs.head-sha }}
-        run: |
-          set -euo pipefail
-
-          current_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid')"
-          if [ "$current_head_sha" != "$EXPECTED_HEAD_SHA" ]; then
-            echo "Pull request head changed; not merging."
-            exit 0
-          fi
-
-          gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --delete-branch
+          # Native protection enforces checks and an up-to-date branch, without reviews.
+          gh pr merge "$pr" --repo "$REPO" --auto --squash \
+            --match-head-commit "$CHECKED_SHA"

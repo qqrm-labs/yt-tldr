@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::util::truncate;
 use anyhow::{Result, bail};
 use serde_json::json;
 use std::time::Duration;
@@ -37,8 +36,7 @@ pub fn transcribe(cfg: &Config, video_url: &str) -> Result<Option<Transcript>> {
         .send()?;
     let status = resp.status();
     if !status.is_success() {
-        let text = resp.text().unwrap_or_default();
-        bail!("Gemini {status}: {}", truncate(&text, 400));
+        return Err(crate::runner::ProviderFailure(status).into());
     }
     let v: serde_json::Value = resp.json()?;
     if let Some(reason) = v.pointer("/promptFeedback/blockReason") {
@@ -56,10 +54,7 @@ pub fn transcribe(cfg: &Config, video_url: &str) -> Result<Option<Transcript>> {
         })
         .unwrap_or_default();
     if text.trim().is_empty() {
-        bail!(
-            "Gemini вернул пустой ответ: {}",
-            truncate(&v.to_string(), 400)
-        );
+        bail!("Gemini returned an empty response");
     }
     let mut text = text;
     if v.pointer("/candidates/0/finishReason")

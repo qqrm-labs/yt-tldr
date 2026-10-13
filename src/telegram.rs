@@ -1,28 +1,27 @@
 use crate::config::Config;
-use crate::util::truncate;
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
 
 const API: &str = "https://api.telegram.org";
 const MAX_MESSAGE_LEN: usize = 3900;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Update {
     pub update_id: u64,
     pub message: Option<Message>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Message {
     pub message_id: i64,
     pub chat: Chat,
     pub text: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Chat {
     pub id: i64,
 }
@@ -47,15 +46,20 @@ fn client() -> reqwest::blocking::Client {
 fn decode<T: DeserializeOwned>(resp: reqwest::blocking::Response) -> Result<T> {
     let status = resp.status();
     if !status.is_success() {
-        let text = resp.text().unwrap_or_default();
-        bail!("HTTP {status}: {}", truncate(&text, 300));
+        bail!("Telegram HTTP {status}");
     }
     Ok(resp.json::<T>()?)
 }
 
 fn call<T: DeserializeOwned>(method: &str, token: &str, body: serde_json::Value) -> Result<T> {
     let url = format!("{API}/bot{token}/{method}");
-    let resp: TgResponse<T> = decode(client().post(url).json(&body).send()?)?;
+    let resp: TgResponse<T> = decode(
+        client()
+            .post(url)
+            .json(&body)
+            .send()
+            .map_err(reqwest::Error::without_url)?,
+    )?;
     if !resp.ok {
         bail!(
             "telegram {method}: {}",
@@ -78,18 +82,18 @@ pub fn get_updates(cfg: &Config, offset: u64) -> Result<Vec<Update>> {
     )
 }
 
-pub fn send_message(cfg: &Config, chat_id: i64, text: &str) -> Result<()> {
-    for chunk in chunk_text(text, MAX_MESSAGE_LEN) {
-        let _: serde_json::Value = call(
-            "sendMessage",
-            cfg.telegram_token()?,
-            json!({
-                "chat_id": chat_id,
-                "text": chunk,
-                "disable_web_page_preview": true,
-            }),
-        )?;
-    }
+pub fn message_chunks(text: &str) -> Vec<String> {
+    chunk_text(text, MAX_MESSAGE_LEN)
+}
+
+pub fn send_chunk(cfg: &Config, chat_id: i64, text: &str) -> Result<()> {
+    let _: serde_json::Value = call(
+        "sendMessage",
+        cfg.telegram_token()?,
+        json!({
+            "chat_id": chat_id, "text": text, "disable_web_page_preview": true,
+        }),
+    )?;
     Ok(())
 }
 

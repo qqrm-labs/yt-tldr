@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::util::truncate;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_json::json;
 use std::time::Duration;
 
@@ -26,8 +26,7 @@ pub fn summarize(cfg: &Config, transcript: &str) -> Result<String> {
         .send()?;
     let status = resp.status();
     if !status.is_success() {
-        let text = resp.text().unwrap_or_default();
-        bail!("Groq {status}: {}", truncate(&text, 400));
+        return Err(crate::runner::ProviderFailure(status).into());
     }
     let v: serde_json::Value = resp.json()?;
     let content = v

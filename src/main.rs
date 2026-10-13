@@ -1,6 +1,7 @@
 mod config;
 mod gemini;
 mod groq;
+mod runner;
 mod state;
 mod telegram;
 mod util;
@@ -15,12 +16,12 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().unwrap_or_default().as_str() {
         "poll" => poll(),
-        "setup" => telegram::setup_commands(&Config::from_env()),
+        "setup" => telegram::setup_commands(&Config::from_env()?),
         "process" => {
             let url = args
                 .next()
                 .context("usage: yt-tldr process <youtube-url>")?;
-            let out = process_video(&Config::from_env(), &url)?;
+            let out = process_video(&Config::from_env()?, &url)?;
             println!("{out}");
             Ok(())
         }
@@ -33,53 +34,41 @@ fn main() -> Result<()> {
 
 /// Один прогон cron-джоба: вычерпать очередь getUpdates, обработать, сохранить стейт.
 fn poll() -> Result<()> {
-    let cfg = Config::from_env();
+    let cfg = Config::from_env()?;
     if cfg.telegram_token.is_none() {
         eprintln!("TELEGRAM_BOT_TOKEN is not set yet - bot is not provisioned, skipping run");
         return Ok(());
     }
-    let mut st = state::State::load(&cfg.state_path)?;
-    let mut handled = 0u32;
-    loop {
-        let updates = telegram::get_updates(&cfg, st.update_offset)?;
+    cfg.validate_poll()?;
+    let mut state = state::State::load(&cfg.state_path)?;
+    let process = |state: &mut state::State, update: &telegram::Update| {
+        runner::process_update(
+            state,
+            update,
+            update
+                .message
+                .as_ref()
+                .is_some_and(|message| cfg.chat_allowed(message.chat.id)),
+            |text| handle_text(&cfg, text),
+            |chat, text| telegram::send_chunk(&cfg, chat, text),
+            |state| state.save(&cfg.state_path),
+        )
+    };
+    // The Telegram queue may expire; retain the original pending update locally.
+    if let Some(pending) = state.pending.as_ref() {
+        let update = pending.update.clone();
+        process(&mut state, &update)?;
+    }
+    let mut handled = 0;
+    while handled < 25 {
+        let updates = telegram::get_updates(&cfg, state.update_offset)?;
         if updates.is_empty() {
             break;
         }
-        for u in updates {
-            st.update_offset = st.update_offset.max(u.update_id + 1);
-            let Some(msg) = u.message else { continue };
-            let key = format!("{}:{}", msg.chat.id, msg.message_id);
-            if st.is_processed(&key) {
-                continue;
-            }
-            // Помечаем до обработки: отравленное сообщение не должно жечь квоты Gemini каждый прогон.
-            st.mark_processed(&key);
-            if !cfg.chat_allowed(msg.chat.id) {
-                continue;
-            }
-            let Some(text) = msg.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
-                continue;
-            };
-            match handle_text(&cfg, text) {
-                Ok(Some(reply)) => telegram::send_message(&cfg, msg.chat.id, &reply)?,
-                Ok(None) => {}
-                Err(e) => {
-                    let _ = telegram::send_message(
-                        &cfg,
-                        msg.chat.id,
-                        &format!("⚠️ Не получилось: {e:#}"),
-                    );
-                }
-            }
+        for update in updates.into_iter().take(25 - handled) {
+            process(&mut state, &update)?;
             handled += 1;
         }
-        if handled >= 25 {
-            break;
-        }
-    }
-    st.save(&cfg.state_path)?;
-    if handled > 0 {
-        eprintln!("processed messages: {handled}");
     }
     Ok(())
 }

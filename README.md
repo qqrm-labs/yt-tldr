@@ -52,8 +52,7 @@ Telegram-бот: кидаешь ссылку на YouTube — получаешь
 5. `gh workflow run -R qqrm-labs/yt-tldr "Run Bot"` — первый прогон (или дождаться cron).
 6. Кинуть боту ссылку на видео, подождать до ~10 минут (cron + обработка).
 
-Опционально: `ALLOWED_CHAT_IDS` (secret, comma-separated) — белый список чатов, если
-ник бота кому-то стал известен и чужаки начали жечь квоту.
+Обязательно для polling: `ALLOWED_CHAT_IDS` (secret, comma-separated) — явный белый список чатов. Без него бот отказывается обращаться к провайдерам.
 
 ## Локально
 
@@ -77,3 +76,13 @@ cargo run -- setup                            # setMyCommands
 - Webhook через Cloudflare Worker (бесплатно) → мгновенная реакция вместо cron.
 - Long-poll режим: один job на несколько часов → ответ за секунды.
 - Выбор языка саммари командой бота.
+
+## Checkpoint and maintenance guarantees
+
+State files are atomically replaced. Only a confirmed missing file/remote state branch permits bootstrap; unreadable, corrupt, or unreachable state stops the run. The save step only follows a successful restore and refuses to overwrite a state branch that changed during the run. Delivery checkpoints are saved after each successful chunk, and remaining chunks resume without re-sending locally recorded messages.
+
+Telegram has no idempotency key: a crash after Telegram accepts a message but before its checkpoint is persisted can still duplicate that message. GitHub runner loss before the final state-branch push can also lose local checkpoints. Exactly-once delivery is not claimed.
+
+Dependabot batches weekly maintenance updates. CI and workflow-security gates require every constituent job to succeed; verified bot commits are matched to the exact checked head before native auto-merge.
+
+Polling requires the `ALLOWED_CHAT_IDS` secret (comma-separated integer chat IDs); malformed or missing allowlists stop polling before paid providers are called. `process <url>` remains independent of Telegram credentials. Transient provider HTTP 408/429/5xx and connection/timeouts retain the update for up to three persisted attempts; failed or exhausted requests produce a generic safe reply. Prepared replies and delivery cursors survive restarts, and processed/offset markers advance only after completion. A Telegram send error retains the unsent tail for a later run.
