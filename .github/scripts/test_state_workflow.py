@@ -52,7 +52,7 @@ class StateWorkflowTests(unittest.TestCase):
                    "FAKE_MODE": mode, "GIT_CALLS": str(root / "calls"),
                    "GITHUB_OUTPUT": str(root / "output"), "RUNNER_TEMP": str(root),
                    "RESTORED_STATE_HEAD": restored}
-            result = subprocess.run(["bash", "-c", step_script(prefix)], cwd=root, env=env,
+            result = subprocess.run([os.environ.get("BASH_EXECUTABLE", "bash"), "-c", step_script(prefix)], cwd=root, env=env,
                                     capture_output=True, text=True, timeout=10, check=False)
             calls = (root / "calls").read_text()
             output = (root / "output").read_text() if (root / "output").exists() else ""
@@ -87,6 +87,62 @@ class StateWorkflowTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn("push", calls)
                 self.assertNotIn("worktree", calls)
+
+
+    def checkpoint_restore(self, status, archive_head, archived_state=True):
+        """Execute the actual migration shell with an isolated checkpoint helper."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '.github/scripts').mkdir(parents=True)
+            script = step_script('Restore authoritative delivery checkpoint')
+            import re
+            state_name = re.search(r'remote_state.py restore ([^\s]+)', script).group(1)
+            state_path = root / state_name
+            state_path.parent.mkdir(parents=True)
+            if archived_state:
+                state_path.write_text('{"cursor":7}')
+            (root / '.github/scripts/remote_state.py').write_text(textwrap.dedent('''\
+                import os, pathlib, sys
+                path = pathlib.Path(sys.argv[2])
+                if sys.argv[1] == 'restore':
+                    status = int(os.environ['RESTORE_STATUS'])
+                    if status == 0: path.write_text('{"cursor":99}')
+                    raise SystemExit(status)
+                pathlib.Path('saved.json').write_text(path.read_text())
+                '''))
+            result = subprocess.run([os.environ.get('BASH_EXECUTABLE', 'bash'), '-c', script], cwd=root,
+                env={**os.environ, 'RESTORE_STATUS': str(status), 'ARCHIVE_HEAD': archive_head},
+                capture_output=True, text=True, timeout=10, check=False)
+            saved = (root / 'saved.json').read_text() if (root / 'saved.json').exists() else None
+            content = state_path.read_text() if state_path.exists() else None
+            return result, saved, content
+
+    def test_remote_restore_failure_never_promotes_archive(self):
+        result, saved, content = self.checkpoint_restore(1, 'old')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNone(saved)
+        self.assertEqual(content, '{"cursor":7}')
+
+    def test_first_migration_preserves_existing_archive_state(self):
+        result, saved, _ = self.checkpoint_restore(3, 'old')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(saved, '{"cursor":7}')
+
+    def test_existing_archive_without_state_is_not_bootstrap(self):
+        result, saved, _ = self.checkpoint_restore(3, 'old', False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNone(saved)
+
+    def test_confirmed_new_installation_initializes_empty_state(self):
+        result, saved, _ = self.checkpoint_restore(3, '', False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(saved, '{}\n')
+
+    def test_authoritative_remote_checkpoint_overrides_old_archive(self):
+        result, saved, content = self.checkpoint_restore(0, 'old')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(saved)
+        self.assertEqual(content, '{"cursor":99}')
 
 
 if __name__ == "__main__":
