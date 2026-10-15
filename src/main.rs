@@ -1,3 +1,4 @@
+mod checkpoint;
 mod config;
 mod gemini;
 mod groq;
@@ -34,6 +35,7 @@ fn main() -> Result<()> {
 
 /// Один прогон cron-джоба: вычерпать очередь getUpdates, обработать, сохранить стейт.
 fn poll() -> Result<()> {
+    checkpoint::require_hosted_configuration()?;
     let cfg = Config::from_env()?;
     if cfg.telegram_token.is_none() {
         eprintln!("TELEGRAM_BOT_TOKEN is not set yet - bot is not provisioned, skipping run");

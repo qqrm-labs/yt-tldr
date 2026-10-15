@@ -77,14 +77,28 @@ cargo run -- setup                            # setMyCommands
 - Long-poll режим: один job на несколько часов → ответ за секунды.
 - Выбор языка саммари командой бота.
 
-## Checkpoint and maintenance guarantees
+## Durable delivery and recovery
 
-State files are atomically replaced. Only a confirmed missing file/remote state branch permits bootstrap; unreadable, corrupt, or unreachable state stops the run. The save step only follows a successful restore and refuses to overwrite a state branch that changed during the run. Delivery checkpoints contain metadata only: update ID, retry count, chunk cursor and SHA-256 fingerprints. Message/chat contents and replies are never written to the public state branch. Legacy dedup keys are migrated to hashes on load; existing branch history is not rewritten.
+The workflow restores the existing `bot-state` source archive, then overlays the authoritative
+`delivery-state/yt-tldr.json` checkpoint. On first use, it migrates the existing state; an
+existing archive without its expected state file is an error. Every provider reservation,
+pre-send intent, and acknowledged cursor is committed synchronously with the GitHub Contents
+API using compare-and-swap. A stale writer, transport error, or missing restore receipt stops
+processing. The final archive push is no longer the durability boundary.
 
-Telegram has no idempotency key: a crash after Telegram accepts a message but before its checkpoint is persisted can still duplicate that message. GitHub runner loss before the final state-branch push can also lose local checkpoints. Exactly-once delivery is not claimed.
+The public checkpoint contains only update IDs, attempt counts, delivery cursors, fingerprints,
+and `awaiting_ack`; user text, chat IDs, generated replies, and tokens are never serialized.
+If Telegram times out or the runner dies after the intent was stored, the next run stops with
+`operator reconciliation required` instead of automatically sending a possible duplicate.
+Telegram does not support an idempotency key, so exactly-once delivery is not claimed.
 
-Dependabot batches weekly maintenance updates. CI and workflow-security gates require every constituent job to succeed; verified bot commits are matched to the exact checked head before native auto-merge.
+To reconcile, first stop concurrent runs and save the current checkpoint and its SHA. Inspect
+the destination chat privately. For a proven absent chunk, clear only `pending.awaiting_ack`;
+for a proven delivered chunk, advance `pending.next_chunk` by one and clear that flag. Keep
+all other fields and write with the inspected blob SHA. If delivery cannot be established,
+leave the intent pending. Never clear the checkpoint or reset the update offset to recover.
+An unavailable original Telegram update or changed regenerated reply still requires manual
+reconciliation. Local runs without the remote helper retain local checkpoints only.
 
-Polling requires the `ALLOWED_CHAT_IDS` secret (comma-separated integer chat IDs); malformed or missing allowlists stop polling before paid providers are called. `process <url>` remains independent of Telegram credentials. Transient provider HTTP 408/429/5xx and connection/timeouts retain the update for up to three persisted attempts; failed or exhausted requests produce a generic safe reply. Prepared replies live only in memory. After restart, Telegram must still retain the original update; providers may be called again within the same persisted three-attempt budget. A partial reply resumes only if the regenerated chunk list has the same SHA-256 fingerprint. A mismatch or expired update stops processing for operator reconciliation; processed/offset markers advance only after completion. A Telegram send error retains the unsent tail for a later run.
-
-For a reconciliation error, inspect the already received Telegram messages before changing pending metadata. Decide whether to abandon the remainder or deliberately resend the full reply; there is no automatic reset that can silently duplicate messages. Durable private reply storage is a separate architectural decision.
+The production workflow only runs from `main` and uses a repository-wide concurrency group.
+No test command sends Telegram messages or requires production credentials.

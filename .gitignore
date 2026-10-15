@@ -1,3 +1,6 @@
 /target
 
 __pycache__/
+
+# Local receipt is refreshed by the authoritative remote checkpoint restore.
+data/*.remote-sha

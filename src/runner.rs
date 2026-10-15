@@ -44,6 +44,13 @@ pub fn process_update(
     mut send: impl FnMut(i64, &str) -> Result<()>,
     mut checkpoint: impl FnMut(&State) -> Result<()>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        !state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.awaiting_ack),
+        "unconfirmed Telegram delivery; operator reconciliation required"
+    );
     if state
         .pending
         .as_ref()
@@ -70,6 +77,7 @@ pub fn process_update(
             chunks: None,
             reply_hash: None,
             next_chunk: 0,
+            awaiting_ack: false,
         });
         checkpoint(state)?;
     }
@@ -112,8 +120,12 @@ pub fn process_update(
         if pending.next_chunk >= chunks.len() {
             break;
         }
-        send(message.chat.id, &chunks[pending.next_chunk])?;
+        let chunk = chunks[pending.next_chunk].clone();
+        state.pending.as_mut().unwrap().awaiting_ack = true;
+        checkpoint(state)?;
+        send(message.chat.id, &chunk)?;
         state.pending.as_mut().unwrap().next_chunk += 1;
+        state.pending.as_mut().unwrap().awaiting_ack = false;
         checkpoint(state)?;
     }
     complete(state, update);
@@ -217,7 +229,7 @@ mod tests {
         assert_eq!(state.update_offset, 2);
     }
     #[test]
-    fn partial_delivery_resumes_only_unsent_chunks_after_identical_regeneration() {
+    fn ambiguous_partial_delivery_requires_reconciliation_before_resuming() {
         let mut state = State::default();
         let mut sends = 0;
         assert!(
@@ -239,6 +251,19 @@ mod tests {
         );
         state = restored(&state);
         assert_eq!(state.pending.as_ref().unwrap().next_chunk, 1);
+        assert!(
+            process_update(
+                &mut state,
+                &update(1),
+                true,
+                |_| panic!("provider before reconciliation"),
+                |_, _| panic!("duplicate send"),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        // The operator has verified that the timed-out chunk was not delivered.
+        state.pending.as_mut().unwrap().awaiting_ack = false;
         process_update(
             &mut state,
             &update(1),
@@ -289,6 +314,7 @@ mod tests {
             .is_err()
         );
         state = restored(&state);
+        state.pending.as_mut().unwrap().awaiting_ack = false;
         let error = process_update(
             &mut state,
             &update(1),
@@ -334,6 +360,8 @@ mod tests {
             )
             .is_err()
         );
+        // A verified no-delivery result is required before retrying.
+        state.pending.as_mut().unwrap().awaiting_ack = false;
         process_update(
             &mut state,
             &update,
@@ -373,5 +401,66 @@ mod tests {
         );
         assert_eq!(state.update_offset, 2);
         assert!(state.is_processed("42:1"));
+    }
+
+    #[test]
+    fn failed_ack_checkpoint_preserves_remote_intent_and_blocks_restart() {
+        let mut state = State::default();
+        let mut remote = Vec::new();
+        let mut sent = false;
+        assert!(
+            process_update(
+                &mut state,
+                &update(1),
+                true,
+                |_| Ok(Some("summary".into())),
+                |_, _| {
+                    sent = true;
+                    Ok(())
+                },
+                |state| {
+                    if state.pending.as_ref().is_some_and(|p| p.next_chunk == 1) {
+                        bail!("remote ack checkpoint unavailable")
+                    }
+                    remote = serde_json::to_vec(state)?;
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert!(sent);
+        let mut restored: State = serde_json::from_slice(&remote).unwrap();
+        assert!(restored.pending.as_ref().unwrap().awaiting_ack);
+        assert!(
+            process_update(
+                &mut restored,
+                &update(1),
+                true,
+                |_| panic!("must not regenerate"),
+                |_, _| panic!("must not resend"),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_intent_checkpoint_prevents_send() {
+        assert!(
+            process_update(
+                &mut State::default(),
+                &update(1),
+                true,
+                |_| Ok(Some("summary".into())),
+                |_, _| panic!("intent was not durable"),
+                |state| {
+                    if state.pending.as_ref().is_some_and(|p| p.awaiting_ack) {
+                        bail!("checkpoint offline")
+                    }
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
     }
 }
