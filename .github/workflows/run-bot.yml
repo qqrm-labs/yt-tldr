@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
@@ -42,6 +42,13 @@ jobs:
 
       - name: Restore persistent state
         id: restore-state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_CONFIG_COUNT: '2'
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: ''
+          GIT_CONFIG_KEY_1: credential.helper
+          GIT_CONFIG_VALUE_1: '!gh auth git-credential'
         shell: bash
         run: |
           set -euo pipefail
@@ -126,6 +133,12 @@ jobs:
       - name: Save state
         if: always() && steps.restore-state.outcome == 'success' && steps.restore-delivery.outcome == 'success'
         env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_CONFIG_COUNT: '2'
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: ''
+          GIT_CONFIG_KEY_1: credential.helper
+          GIT_CONFIG_VALUE_1: '!gh auth git-credential'
           RESTORED_STATE_HEAD: ${{ steps.restore-state.outputs.head }}
         shell: bash
         run: |

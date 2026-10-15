@@ -102,3 +102,19 @@ reconciliation. Local runs without the remote helper retain local checkpoints on
 
 The production workflow only runs from `main` and uses a repository-wide concurrency group.
 No test command sends Telegram messages or requires production credentials.
+
+The checkout never persists its token. Legacy archive fetch/push receives `GH_TOKEN` only in
+its own step and uses a process-scoped Git credential helper; no authentication is written
+to the Git configuration. Dependency builds and caches receive no publication credential.
+The checkpoint helper and bot receive their required credentials only during their runtime steps.
+
+The checkpoint uses the application's typed JSON state, preserving existing fields and adding
+defaults only for compatible fields. This migration creates its
+single known state key only when `delivery-state` is confirmed absent. A pre-existing branch
+without that key is not an empty installation: it stops for explicit initialization or
+reconciliation. Adding another key later requires an intentional migration, never automatic
+fallback to an empty state. The `bot-state` archive is the initial migration source only;
+subsequent runs always restore the authoritative checkpoint over that archive.
+
+After migration, use the current workflow from `main`; do not rerun historical jobs from before
+the checkpoint migration, because their old code does not implement this delivery contract.
