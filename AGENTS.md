@@ -8,8 +8,8 @@ logic runs in GitHub Actions ("Run Bot", cron */5), persistent state lives on th
 ## Pipeline
 getUpdates drain → extract YouTube URL → Gemini free tier (native YouTube URL
 understanding, no video download) → transcript → Groq (`openai/gpt-oss-120b`) →
-TL;DR + takeaways → sendMessage. State (update offset + processed message ids) is
-committed back to `bot-state` by the workflow, not by the binary.
+TL;DR + takeaways → sendMessage. The binary synchronously checkpoints metadata to `delivery-state` through the workflow-provided
+helper. The workflow retains `bot-state` as an archive; it is not the send durability boundary.
 
 ## Validation loop
 - `cargo fmt --all -- --check`

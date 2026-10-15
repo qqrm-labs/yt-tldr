@@ -13,6 +13,9 @@ pub struct Pending {
     pub chunks: Option<Vec<String>>,
     pub reply_hash: Option<String>,
     pub next_chunk: usize,
+    /// Durable intent without a confirmed Telegram acknowledgement.
+    #[serde(default)]
+    pub awaiting_ack: bool,
 }
 
 /// Хвост дедуп-списка, который держим в стейте.
@@ -78,17 +81,28 @@ impl State {
         temporary.write_all(&serde_json::to_vec_pretty(self)?)?;
         temporary.as_file().sync_all()?;
         temporary.persist(path)?;
-        Ok(())
+        crate::checkpoint::save(Path::new(path))
     }
 }
 
 pub fn fingerprint(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    let hex: String = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("sha256:{hex}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fingerprint_format_remains_compatible_across_sha2_versions() {
+        assert_eq!(
+            fingerprint(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
     #[test]
     fn legacy_state_loads_and_atomic_checkpoints_replace_it() {
         let dir = tempfile::tempdir().unwrap();

@@ -15,11 +15,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: run-bot-${{ github.ref }}
+  group: run-bot
   cancel-in-progress: false
 
 jobs:
   run:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -69,6 +70,28 @@ jobs:
             exit 1
           fi
 
+      - name: Restore authoritative delivery checkpoint
+        id: restore-delivery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DELIVERY_STATE_KEY: yt-tldr.json
+          ARCHIVE_HEAD: ${{ steps.restore-state.outputs.head }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          python3 .github/scripts/remote_state.py restore data/bot-state.json || status=$?
+          if [[ "$status" == 3 ]]; then
+            if [[ ! -f data/bot-state.json ]]; then
+              test -z "$ARCHIVE_HEAD" || { echo "Existing archive has no state; refusing empty delivery memory" >&2; exit 1; }
+              mkdir -p data
+              printf '{}\n' > data/bot-state.json
+            fi
+            python3 .github/scripts/remote_state.py save data/bot-state.json
+          elif [[ "$status" != 0 ]]; then
+            exit "$status"
+          fi
+
       - name: Build bot
         run: cargo build --release --locked
 
@@ -88,6 +111,9 @@ jobs:
       - name: Poll Telegram
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.youtube_url != '') }}
         env:
+          DELIVERY_CHECKPOINT: .github/scripts/remote_state.py
+          DELIVERY_STATE_KEY: yt-tldr.json
+          GH_TOKEN: ${{ github.token }}
           ALLOWED_CHAT_IDS: ${{ secrets.ALLOWED_CHAT_IDS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -98,7 +124,7 @@ jobs:
         run: ./target/release/yt-tldr poll
 
       - name: Save state
-        if: always() && steps.restore-state.outcome == 'success'
+        if: always() && steps.restore-state.outcome == 'success' && steps.restore-delivery.outcome == 'success'
         env:
           RESTORED_STATE_HEAD: ${{ steps.restore-state.outputs.head }}
         shell: bash
