@@ -7,7 +7,7 @@ Telegram-бот: кидаешь ссылку на YouTube — получаешь
 ты → Telegram
         │  cron */5: «Run Bot»
         ▼
-   Rust (qqrm-labs/yt-tldr)
+   Rust (qqrm/yt-tldr)
         │  1. getUpdates → вытащить YouTube-ссылку
         │  2. Gemini (free tier) → полный транскрипт видео по ссылке
         │  3. Groq (free tier)   → TL;DR + тейки
@@ -44,12 +44,12 @@ Telegram-бот: кидаешь ссылку на YouTube — получаешь
 3. Ключ Groq (console.groq.com) — можно тот же, что использует weekly-gh-digest.
 4. Залить секреты:
    ```sh
-   gh secret set -R qqrm-labs/yt-tldr TELEGRAM_BOT_TOKEN
-   gh secret set -R qqrm-labs/yt-tldr GEMINI_API_KEY
-   gh secret set -R qqrm-labs/yt-tldr GROQ_API_KEY
+   gh secret set -R qqrm/yt-tldr TELEGRAM_BOT_TOKEN
+   gh secret set -R qqrm/yt-tldr GEMINI_API_KEY
+   gh secret set -R qqrm/yt-tldr GROQ_API_KEY
    ```
    Модели (опционально) — в repo variables `GEMINI_MODEL` / `GROQ_MODEL`.
-5. `gh workflow run -R qqrm-labs/yt-tldr "Run Bot"` — первый прогон (или дождаться cron).
+5. `gh workflow run -R qqrm/yt-tldr "Run Bot"` — первый прогон (или дождаться cron).
 6. Кинуть боту ссылку на видео, подождать до ~10 минут (cron + обработка).
 
 Обязательно для polling: `ALLOWED_CHAT_IDS` (secret, comma-separated) — явный белый список чатов. Без него бот отказывается обращаться к провайдерам.
