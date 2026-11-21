@@ -657,7 +657,10 @@ fn doctor_only_reads_bot_webhook_and_model_metadata() {
         step("/botfixture-token/getMe", json!({"ok":true,"result":{"is_bot":true,"username":"fixture_bot"}})),
         step("/botfixture-token/getWebhookInfo", json!({"ok":true,"result":{"url":""}})),
         step("/models/gemini-fixture", json!({"name":"models/gemini-fixture","supportedGenerationMethods":["generateContent"]})).get(),
-        step("/groq/models/fixture%2Fsummary", json!({"id":"fixture/summary","active":true})).get(),
+        step("/groq/models", json!({"object":"list","data":[
+            {"id":"fixture/summary-other","active":false},
+            {"id":"fixture/summary","active":true}
+        ]})).get(),
     ]);
     let report = app::doctor(&cfg, &fixture.services, &Budget::new(POLL_BUDGET)).unwrap();
     assert!(report.contains("https://t.me/fixture_bot") && report.contains("Allowed chats: 1"));
@@ -671,6 +674,45 @@ fn doctor_only_reads_bot_webhook_and_model_metadata() {
     }
     assert!(!std::path::Path::new(&cfg.state_path).exists());
     fixture.finish();
+}
+
+#[test]
+fn doctor_model_readiness_rejects_missing_inactive_or_malformed_groq_entries() {
+    for (case, response) in [
+        (
+            "missing configured id",
+            json!({"object":"list","data":[{"id":"fixture/summary-other","active":true}]}),
+        ),
+        (
+            "inactive configured id",
+            json!({"object":"list","data":[
+                {"id":"fixture/summary-other","active":true},
+                {"id":"fixture/summary","active":false}
+            ]}),
+        ),
+        (
+            "malformed data",
+            json!({"object":"list","data":{"id":"fixture/summary","active":true}}),
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let cfg = cfg(&directory);
+        let fixture = Fixture::new(vec![
+            step(
+                "/models/gemini-fixture",
+                json!({"name":"models/gemini-fixture","supportedGenerationMethods":["generateContent"]}),
+            )
+            .get(),
+            step("/groq/models", response).get(),
+        ]);
+        let error = crate::http::check_models(&cfg, &fixture.services, &Budget::new(POLL_BUDGET))
+            .expect_err(case);
+        assert!(!error.downcast_ref::<ProviderError>().unwrap().retryable());
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("groq") && rendered.contains("model_readiness"));
+        assert!(!rendered.contains("fixture-groq-key") && !rendered.contains("fixture/summary"));
+        assert_eq!(fixture.finish().len(), 2);
+    }
 }
 
 #[test]
