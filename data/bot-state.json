@@ -1,11 +1,7 @@
 {
-  "update_offset": 315039369,
-  "processed": [],
-  "pending": {
-    "update_id": 315039369,
-    "attempts": 1,
-    "reply_hash": null,
-    "next_chunk": 0,
-    "awaiting_ack": false
-  }
+  "update_offset": 315039370,
+  "processed": [
+    "sha256:2a71e15e3ece90386eaaa2af84fd75c37265167d5ca0e01567472d497156dd01"
+  ],
+  "pending": null
 }
