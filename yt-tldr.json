@@ -6,6 +6,6 @@
     "attempts": 2,
     "reply_hash": "sha256:b0556e45fb31fb88758d8f127ce0d22cd9d7a7eb767d2b28539e65068168446a",
     "next_chunk": 0,
-    "awaiting_ack": false
+    "awaiting_ack": true
   }
 }
