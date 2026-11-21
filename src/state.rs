@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize)]
 pub struct Pending {
@@ -16,6 +17,9 @@ pub struct Pending {
     /// Durable intent without a confirmed Telegram acknowledgement.
     #[serde(default)]
     pub awaiting_ack: bool,
+    /// A confirmed throttle never becomes an ambiguous delivery intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_not_before: Option<u64>,
 }
 
 /// Хвост дедуп-списка, который держим в стейте.
@@ -71,7 +75,12 @@ impl State {
         }
     }
 
-    pub fn save(&self, path: &str) -> Result<()> {
+    pub fn save(&self, path: &str, timeout: Duration) -> Result<()> {
+        self.write_local(path)?;
+        crate::checkpoint::save(Path::new(path), timeout)
+    }
+
+    pub fn write_local(&self, path: &str) -> Result<()> {
         let parent = Path::new(path)
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -81,7 +90,7 @@ impl State {
         temporary.write_all(&serde_json::to_vec_pretty(self)?)?;
         temporary.as_file().sync_all()?;
         temporary.persist(path)?;
-        crate::checkpoint::save(Path::new(path))
+        Ok(())
     }
 }
 
@@ -114,7 +123,7 @@ mod tests {
         assert!(state.pending.is_none());
         assert!(state.is_processed("1:2"));
         state.update_offset = 43;
-        state.save(path).unwrap();
+        state.write_local(path).unwrap();
         assert!(!std::fs::read_to_string(path).unwrap().contains("1:2"));
         assert_eq!(State::load(path).unwrap().update_offset, 43);
     }

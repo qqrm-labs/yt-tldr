@@ -1,5 +1,9 @@
-use crate::config::Config;
-use anyhow::{Result, bail};
+use crate::{
+    config::Config,
+    http::{self, ProviderError, Services},
+    runtime::Budget,
+};
+use anyhow::Result;
 use serde_json::json;
 use std::time::Duration;
 
@@ -8,72 +12,98 @@ const PROMPT: &str = "Первая строка ответа — строго в
 pub struct Transcript {
     pub title: Option<String>,
     pub text: String,
+    pub truncated: bool,
 }
 
-/// Gemini из бесплатного тира понимает YouTube-ссылки нативно: видео не нужно скачивать
-/// (yt-dlp с раннеров Actions YouTube часто блокирует). None = речи в видео нет.
-pub fn transcribe(cfg: &Config, video_url: &str) -> Result<Option<Transcript>> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()?;
+pub fn transcribe(
+    cfg: &Config,
+    services: &Services,
+    budget: &Budget,
+    video_url: &str,
+) -> Result<Option<Transcript>> {
+    let key = cfg.gemini_key()?;
+    let mut generation_config = json!({"maxOutputTokens": 16384});
+    // Gemini 3 uses thinkingLevel; thinkingBudget: 0 is not its contract.
+    // Other configured models retain their own default thinking behavior.
+    if cfg.gemini_model.starts_with("gemini-3") {
+        generation_config["thinkingConfig"] = json!({"thinkingLevel": "LOW"});
+    }
     let body = json!({
         "contents": [{"parts": [
             {"file_data": {"file_uri": video_url}},
             {"text": PROMPT},
         ]}],
-        "generationConfig": {
-            "thinkingConfig": {"thinkingBudget": 0},
-            "maxOutputTokens": 16384,
-        },
+        "generationConfig": generation_config,
     });
-    let resp = client
-        .post(format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-            cfg.gemini_model
-        ))
-        .header("x-goog-api-key", cfg.gemini_key()?)
-        .json(&body)
-        .send()?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(crate::runner::ProviderFailure(status).into());
+    let value = http::provider_request(
+        "gemini",
+        "transcribe",
+        budget,
+        Duration::from_secs(120),
+        || {
+            services
+                .client
+                .post(services.gemini_url(&cfg.gemini_model))
+                .header("x-goog-api-key", key)
+                .json(&body)
+        },
+    )?;
+    parse_transcript(value)
+}
+
+fn parse_transcript(value: serde_json::Value) -> Result<Option<Transcript>> {
+    let invalid = |reason| ProviderError::invalid("gemini", "transcribe", reason);
+    let finish = value
+        .pointer("/candidates/0/finishReason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    http::completion_log(
+        "gemini",
+        finish,
+        value
+            .pointer("/usageMetadata/promptTokenCount")
+            .and_then(|value| value.as_u64()),
+        value
+            .pointer("/usageMetadata/candidatesTokenCount")
+            .and_then(|value| value.as_u64()),
+    );
+    if value.pointer("/promptFeedback/blockReason").is_some() {
+        return Err(invalid("prompt blocked").into());
     }
-    let v: serde_json::Value = resp.json()?;
-    if let Some(reason) = v.pointer("/promptFeedback/blockReason") {
-        bail!("Gemini заблокировал запрос: {reason}");
-    }
-    let text = v
+    let truncated = match finish {
+        "STOP" => false,
+        "MAX_TOKENS" => true,
+        _ => return Err(invalid("missing, blocked, or unsupported finish reason").into()),
+    };
+    let text = value
         .pointer("/candidates/0/content/parts")
-        .and_then(|p| p.as_array())
+        .and_then(|parts| parts.as_array())
         .map(|parts| {
             parts
                 .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .filter(|part| part.get("thought").and_then(|value| value.as_bool()) != Some(true))
+                .filter_map(|part| part.get("text").and_then(|value| value.as_str()))
                 .collect::<Vec<_>>()
                 .join("")
         })
         .unwrap_or_default();
-    if text.trim().is_empty() {
-        bail!("Gemini returned an empty response");
-    }
-    let mut text = text;
-    if v.pointer("/candidates/0/finishReason")
-        .and_then(|f| f.as_str())
-        == Some("MAX_TOKENS")
-    {
-        text.push_str("\n…[транскрипт обрезан по лимиту]");
-    }
-    if text.trim().starts_with("NO_SPEECH") {
+    let text = text.trim();
+    if text == "NO_SPEECH" && !truncated {
         return Ok(None);
     }
-    let mut title = None;
-    if let Some(rest) = text.strip_prefix("TITLE:") {
+    let (title, text) = if let Some(rest) = text.strip_prefix("TITLE:") {
         let (line, tail) = rest.split_once('\n').unwrap_or((rest, ""));
-        title = Some(line.trim().to_string());
-        text = tail.trim_start().to_string();
+        let title = (!line.trim().is_empty()).then(|| line.trim().to_string());
+        (title, tail.trim().to_string())
+    } else {
+        (None, text.to_string())
+    };
+    if text.is_empty() {
+        return Err(invalid("empty transcript").into());
     }
-    if text.trim().is_empty() {
-        bail!("Gemini не дал транскрипт");
-    }
-    Ok(Some(Transcript { title, text }))
+    Ok(Some(Transcript {
+        title,
+        text,
+        truncated,
+    }))
 }
