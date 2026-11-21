@@ -43,13 +43,8 @@ impl Services {
         format!("{}/{model}", self.gemini_base)
     }
 
-    pub fn groq_model_url(&self, model: &str) -> Result<reqwest::Url> {
-        let mut url = reqwest::Url::parse(&format!("{}/models/", self.groq_base))?;
-        url.path_segments_mut()
-            .expect("fixed HTTPS base")
-            .pop_if_empty()
-            .push(model);
-        Ok(url)
+    pub fn groq_models_url(&self) -> String {
+        format!("{}/models", self.groq_base)
     }
 
     // Deliberately absent from production: credentials never go to an endpoint
@@ -107,21 +102,32 @@ pub fn check_models(
         )
         .into());
     }
-    let url = services.groq_model_url(&cfg.groq_model)?;
-    let model = provider_request(
+    // Model IDs can contain '/', so use the documented list endpoint rather
+    // than relying on how the API/router interprets an encoded path segment.
+    let response = provider_request(
         "groq",
         "model_readiness",
         budget,
         Duration::from_secs(20),
-        || services.client.get(url.clone()).bearer_auth(groq_key),
+        || {
+            services
+                .client
+                .get(services.groq_models_url())
+                .bearer_auth(groq_key)
+        },
     )?;
-    if model.get("id").and_then(|value| value.as_str()) != Some(cfg.groq_model.as_str())
-        || model.get("active").and_then(|value| value.as_bool()) == Some(false)
-    {
+    let models = response
+        .get("data")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| ProviderError::invalid("groq", "model_readiness", "malformed model list"))?;
+    if !models.iter().any(|model| {
+        model.get("id").and_then(|value| value.as_str()) == Some(cfg.groq_model.as_str())
+            && model.get("active").and_then(|value| value.as_bool()) == Some(true)
+    }) {
         return Err(ProviderError::invalid(
             "groq",
             "model_readiness",
-            "configured model is unavailable",
+            "configured model is missing or inactive",
         )
         .into());
     }
