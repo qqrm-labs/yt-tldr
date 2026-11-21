@@ -224,6 +224,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          printf '## Public video check\n\nCommit: `%s`\n\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          printf '## Public video check\n\nCommit: %s\n\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
           # Generated text belongs in the summary, not the runner command stream.
           ./target/release/yt-tldr process "$TEST_URL" >> "$GITHUB_STEP_SUMMARY"
