@@ -2,17 +2,26 @@ name: Run Bot
 
 on:
   schedule:
-    # Каждые 5 минут: вычерпать очередь getUpdates. Первая реакция на ссылку — 0-10 минут.
+    # Best-effort polling: GitHub may delay or drop scheduled runs.
     - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
+      operation:
+        description: Check deployment, configure bot commands, or poll Telegram
+        type: choice
+        required: true
+        default: check
+        options:
+          - check
+          - setup
+          - poll
       youtube_url:
-        description: Process this YouTube video instead of polling Telegram (test)
+        description: Public YouTube URL to check without Telegram (result is public)
         type: string
         required: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: run-bot
@@ -20,9 +29,11 @@ concurrency:
 
 jobs:
   run:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (inputs.operation == 'poll' && inputs.youtube_url == ''))
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -102,21 +113,7 @@ jobs:
       - name: Build bot
         run: cargo build --release --locked
 
-      - name: Process test video
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.youtube_url != '' }}
-        env:
-          TEST_URL: ${{ inputs.youtube_url }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
-          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./target/release/yt-tldr process "$TEST_URL" | tee "$GITHUB_STEP_SUMMARY"
-
       - name: Poll Telegram
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.youtube_url != '') }}
         env:
           DELIVERY_CHECKPOINT: .github/scripts/remote_state.py
           DELIVERY_STATE_KEY: yt-tldr.json
@@ -172,3 +169,61 @@ jobs:
             git -C "$state_dir" commit -m "Update bot state"
             git -C "$state_dir" push origin HEAD:bot-state
           fi
+
+  deployment-check:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && (inputs.youtube_url != '' || inputs.operation == 'check' || inputs.operation == 'setup')
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - name: Cache build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build bot
+        run: cargo build --release --locked
+
+      - name: Check bot readiness
+        if: inputs.youtube_url == ''
+        env:
+          ALLOWED_CHAT_IDS: ${{ secrets.ALLOWED_CHAT_IDS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/yt-tldr doctor | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure bot commands
+        if: inputs.operation == 'setup' && inputs.youtube_url == ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: ./target/release/yt-tldr setup
+
+      - name: Process public test video
+        if: inputs.youtube_url != ''
+        env:
+          TEST_URL: ${{ inputs.youtube_url }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '## Public video check\n\nCommit: %s\n\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          # Generated text belongs in the summary, not the runner command stream.
+          ./target/release/yt-tldr process "$TEST_URL" >> "$GITHUB_STEP_SUMMARY"

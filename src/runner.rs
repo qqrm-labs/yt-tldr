@@ -1,29 +1,18 @@
 use crate::{
+    http::ProviderError,
+    runtime::{BudgetExhausted, unix_time},
     state::{Pending, State},
-    telegram::Update,
+    telegram::{SendNotAttempted, TelegramRejection, Update},
 };
 use anyhow::{Result, bail};
 
 const MAX_PROVIDER_ATTEMPTS: u8 = 3;
 const FAILURE_REPLY: &str = "⚠️ Не получилось обработать видео. Попробуйте отправить ссылку позже.";
 
-#[derive(Debug)]
-pub struct ProviderFailure(pub reqwest::StatusCode);
-impl std::fmt::Display for ProviderFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "provider HTTP {}", self.0)
-    }
-}
-impl std::error::Error for ProviderFailure {}
-
 fn retryable(error: &anyhow::Error) -> bool {
-    if let Some(ProviderFailure(status)) = error.downcast_ref::<ProviderFailure>() {
-        status.is_server_error() || status.as_u16() == 429 || status.as_u16() == 408
-    } else {
-        error
-            .downcast_ref::<reqwest::Error>()
-            .is_some_and(|e| e.is_timeout() || e.is_connect())
-    }
+    error
+        .downcast_ref::<ProviderError>()
+        .is_some_and(ProviderError::retryable)
 }
 
 fn complete(state: &mut State, update: &Update) {
@@ -58,6 +47,14 @@ pub fn process_update(
     {
         bail!("finish the pending update before processing another");
     }
+    if state
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.retry_not_before)
+        .is_some_and(|not_before| unix_time() < not_before)
+    {
+        bail!("retry delay is still active; update retained for the next run");
+    }
     let Some(message) = &update.message else {
         complete(state, update);
         return checkpoint(state);
@@ -78,6 +75,7 @@ pub fn process_update(
             reply_hash: None,
             next_chunk: 0,
             awaiting_ack: false,
+            retry_not_before: None,
         });
         checkpoint(state)?;
     }
@@ -90,10 +88,23 @@ pub fn process_update(
             checkpoint(state)?; // A crash still consumes the reserved attempt.
             match analyze(message.text.as_deref().unwrap().trim()) {
                 Ok(reply) => reply,
+                Err(error) if error.is::<BudgetExhausted>() => return Err(error),
                 Err(error) if retryable(&error) && attempts + 1 < MAX_PROVIDER_ATTEMPTS => {
+                    state.pending.as_mut().unwrap().retry_not_before = error
+                        .downcast_ref::<ProviderError>()
+                        .and_then(ProviderError::retry_not_before);
+                    checkpoint(state)?;
+                    eprintln!("analysis_retry {error}");
                     bail!("temporary provider failure; update retained for the next run");
                 }
-                Err(_) => Some(FAILURE_REPLY.to_string()),
+                Err(error) => {
+                    if let Some(error) = error.downcast_ref::<ProviderError>() {
+                        eprintln!("analysis_failed {error}");
+                    } else {
+                        eprintln!("analysis_failed category=configuration_or_contract");
+                    }
+                    Some(FAILURE_REPLY.to_string())
+                }
             }
         };
         let chunks = reply
@@ -123,9 +134,36 @@ pub fn process_update(
         let chunk = chunks[pending.next_chunk].clone();
         state.pending.as_mut().unwrap().awaiting_ack = true;
         checkpoint(state)?;
-        send(message.chat.id, &chunk)?;
+        if let Err(error) = send(message.chat.id, &chunk) {
+            let rejection = error.downcast_ref::<TelegramRejection>();
+            if rejection.is_some() || error.is::<SendNotAttempted>() {
+                let pending = state.pending.as_mut().unwrap();
+                pending.awaiting_ack = false;
+                pending.retry_not_before = rejection
+                    .filter(|rejection| rejection.error_code == 429)
+                    .map(|rejection| {
+                        unix_time()
+                            .saturating_add(rejection.retry_after.unwrap_or(60))
+                            .saturating_add(1)
+                    });
+                checkpoint(state)?;
+                if let Some(rejection) = rejection {
+                    eprintln!(
+                        "delivery_failure confirmed_rejection={} retry_after={}",
+                        rejection.error_code,
+                        rejection.retry_after.unwrap_or(0)
+                    );
+                    if matches!(rejection.error_code, 400 | 403) {
+                        complete(state, update);
+                        checkpoint(state)?;
+                    }
+                }
+            }
+            return Err(error);
+        }
         state.pending.as_mut().unwrap().next_chunk += 1;
         state.pending.as_mut().unwrap().awaiting_ack = false;
+        state.pending.as_mut().unwrap().retry_not_before = None;
         checkpoint(state)?;
     }
     complete(state, update);
@@ -172,7 +210,12 @@ mod tests {
                     &mut state,
                     &update(1),
                     true,
-                    |_| Err(ProviderFailure(reqwest::StatusCode::from_u16(status).unwrap()).into()),
+                    |_| Err(ProviderError::http(
+                        "fixture",
+                        "analyze",
+                        reqwest::StatusCode::from_u16(status).unwrap()
+                    )
+                    .into()),
                     |_, _| panic!("no reply yet"),
                     |_| Ok(())
                 )
@@ -206,7 +249,12 @@ mod tests {
                     &mut state,
                     &update(1),
                     true,
-                    |_| Err(ProviderFailure(reqwest::StatusCode::TOO_MANY_REQUESTS).into()),
+                    |_| Err(ProviderError::http(
+                        "fixture",
+                        "analyze",
+                        reqwest::StatusCode::TOO_MANY_REQUESTS
+                    )
+                    .into()),
                     |_, _| Ok(()),
                     |_| Ok(())
                 )
@@ -218,7 +266,14 @@ mod tests {
             &mut state,
             &update(1),
             true,
-            |_| Err(ProviderFailure(reqwest::StatusCode::TOO_MANY_REQUESTS).into()),
+            |_| {
+                Err(ProviderError::http(
+                    "fixture",
+                    "analyze",
+                    reqwest::StatusCode::TOO_MANY_REQUESTS,
+                )
+                .into())
+            },
             |_, text| {
                 assert_eq!(text, FAILURE_REPLY);
                 Ok(())
@@ -393,7 +448,12 @@ mod tests {
                 &mut state,
                 &update(2),
                 true,
-                |_| Err(ProviderFailure(reqwest::StatusCode::INTERNAL_SERVER_ERROR).into()),
+                |_| Err(ProviderError::http(
+                    "fixture",
+                    "analyze",
+                    reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                )
+                .into()),
                 |_, _| Ok(()),
                 |_| Ok(())
             )

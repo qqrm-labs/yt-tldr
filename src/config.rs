@@ -48,6 +48,8 @@ impl Config {
     }
 
     pub fn validate_poll(&self) -> Result<()> {
+        self.telegram_token()?;
+        self.validate_process()?;
         anyhow::ensure!(
             !self.allowed_chats.is_empty(),
             "ALLOWED_CHAT_IDS is required before polling Telegram"
@@ -55,8 +57,46 @@ impl Config {
         Ok(())
     }
 
+    pub fn validate_process(&self) -> Result<()> {
+        self.gemini_key()?;
+        self.groq_key()?;
+        for (name, model, allow_slash) in [
+            ("GEMINI_MODEL", &self.gemini_model, false),
+            ("GROQ_MODEL", &self.groq_model, true),
+        ] {
+            anyhow::ensure!(
+                !model.is_empty()
+                    && model.len() <= 128
+                    && model.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'-' | b'_' | b'.')
+                            || (allow_slash && byte == b'/')
+                    }),
+                "{name} must be a model identifier"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn allowed_chat_count(&self) -> usize {
+        self.allowed_chats.len()
+    }
+
     pub fn chat_allowed(&self, chat_id: i64) -> bool {
         self.allowed_chats.contains(&chat_id)
+    }
+
+    #[cfg(test)]
+    pub fn fixture(state_path: String) -> Self {
+        Self {
+            telegram_token: Some("fixture-token".into()),
+            gemini_key: Some("fixture-gemini-key".into()),
+            groq_key: Some("fixture-groq-key".into()),
+            gemini_model: "gemini-fixture".into(),
+            groq_model: "fixture/summary".into(),
+            state_path,
+            allowed_chats: vec![42],
+        }
     }
 }
 
@@ -85,5 +125,24 @@ mod tests {
         for invalid in ["42,typo", "42,", "", "*"] {
             assert!(parse_allowlist(Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn poll_requires_all_credentials_but_process_never_needs_telegram() {
+        let original = Config::fixture("unused.json".into());
+        original.validate_poll().unwrap();
+        let mut cfg = original.clone();
+        cfg.telegram_token = None;
+        assert!(cfg.validate_poll().is_err());
+        cfg.validate_process().unwrap();
+        cfg = original.clone();
+        cfg.allowed_chats.clear();
+        assert!(cfg.validate_poll().is_err());
+        cfg = original.clone();
+        cfg.gemini_key = None;
+        assert!(cfg.validate_poll().is_err());
+        cfg = original;
+        cfg.groq_key = None;
+        assert!(cfg.validate_poll().is_err());
     }
 }
