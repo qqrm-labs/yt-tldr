@@ -1,20 +1,16 @@
 name: Run Bot
 
 on:
-  schedule:
-    # Best-effort polling: GitHub may delay or drop scheduled runs.
-    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       operation:
-        description: Check deployment, configure bot commands, or poll Telegram
+        description: Check deployment or configure the dedicated YouTube bot
         type: choice
         required: true
         default: check
         options:
           - check
           - setup
-          - poll
       youtube_url:
         description: Public YouTube URL to check without Telegram (result is public)
         type: string
@@ -28,148 +24,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  run:
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (inputs.operation == 'poll' && inputs.youtube_url == ''))
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CARGO_TERM_COLOR: always
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-
-      - name: Cache build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - name: Restore persistent state
-        id: restore-state
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GIT_CONFIG_COUNT: '2'
-          GIT_CONFIG_KEY_0: credential.helper
-          GIT_CONFIG_VALUE_0: ''
-          GIT_CONFIG_KEY_1: credential.helper
-          GIT_CONFIG_VALUE_1: '!gh auth git-credential'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # A transport/authentication failure must never mean an absent branch.
-          remote_ref=$(git ls-remote --heads origin refs/heads/bot-state)
-          if [[ -z "$remote_ref" ]]; then
-            echo "No bot-state branch yet; confirmed initial bootstrap."
-            echo "head=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          ok=0
-          for attempt in 1 2 3; do
-            if git fetch origin bot-state:refs/remotes/origin/bot-state 2>/dev/null; then
-              ok=1
-              break
-            fi
-            echo "fetch attempt $attempt failed; retrying in 10s" >&2
-            sleep 10
-          done
-          if [[ "$ok" == "1" ]]; then
-            echo "head=$(git rev-parse origin/bot-state)" >> "$GITHUB_OUTPUT"
-            mkdir -p data
-            git archive origin/bot-state data | tar -x
-          else
-            echo "bot-state exists but could not be fetched; refusing empty dedup state" >&2
-            exit 1
-          fi
-
-      - name: Restore authoritative delivery checkpoint
-        id: restore-delivery
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DELIVERY_STATE_KEY: yt-tldr.json
-          ARCHIVE_HEAD: ${{ steps.restore-state.outputs.head }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          status=0
-          python3 .github/scripts/remote_state.py restore data/bot-state.json || status=$?
-          if [[ "$status" == 3 ]]; then
-            if [[ ! -f data/bot-state.json ]]; then
-              test -z "$ARCHIVE_HEAD" || { echo "Existing archive has no state; refusing empty delivery memory" >&2; exit 1; }
-              mkdir -p data
-              printf '{}\n' > data/bot-state.json
-            fi
-            python3 .github/scripts/remote_state.py save data/bot-state.json
-          elif [[ "$status" != 0 ]]; then
-            exit "$status"
-          fi
-
-      - name: Build bot
-        run: cargo build --release --locked
-
-      - name: Poll Telegram
-        env:
-          DELIVERY_CHECKPOINT: .github/scripts/remote_state.py
-          DELIVERY_STATE_KEY: yt-tldr.json
-          GH_TOKEN: ${{ github.token }}
-          ALLOWED_CHAT_IDS: ${{ secrets.ALLOWED_CHAT_IDS }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
-          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
-        shell: bash
-        run: ./target/release/yt-tldr poll
-
-      - name: Save state
-        if: always() && steps.restore-state.outcome == 'success' && steps.restore-delivery.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GIT_CONFIG_COUNT: '2'
-          GIT_CONFIG_KEY_0: credential.helper
-          GIT_CONFIG_VALUE_0: ''
-          GIT_CONFIG_KEY_1: credential.helper
-          GIT_CONFIG_VALUE_1: '!gh auth git-credential'
-          RESTORED_STATE_HEAD: ${{ steps.restore-state.outputs.head }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! -d data ]]; then
-            echo "No data directory; state was not changed."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          state_dir="$RUNNER_TEMP/yt-tldr-state"
-          remote_ref=$(git ls-remote --heads origin refs/heads/bot-state)
-          remote_head=${remote_ref%%$'\t'*}
-          if [[ "$remote_head" != "$RESTORED_STATE_HEAD" ]]; then
-            echo "bot-state changed during this run; refusing to overwrite newer state" >&2
-            exit 1
-          fi
-          if [[ -n "$remote_head" ]]; then
-            git fetch origin bot-state:refs/remotes/origin/bot-state
-            test "$(git rev-parse origin/bot-state)" = "$RESTORED_STATE_HEAD"
-            git worktree add "$state_dir" origin/bot-state
-          else
-            git worktree add --detach "$state_dir" HEAD
-            git -C "$state_dir" checkout --orphan bot-state
-            git -C "$state_dir" rm -rf . >/dev/null 2>&1 || true
-          fi
-          mkdir -p "$state_dir/data"
-          cp -a data/. "$state_dir/data/"
-          git -C "$state_dir" add data
-          if ! git -C "$state_dir" diff --cached --quiet; then
-            git -C "$state_dir" commit -m "Update bot state"
-            git -C "$state_dir" push origin HEAD:bot-state
-          fi
-
   deployment-check:
     if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && (inputs.youtube_url != '' || inputs.operation == 'check' || inputs.operation == 'setup')
     permissions:
@@ -197,7 +51,8 @@ jobs:
         if: inputs.youtube_url == ''
         env:
           ALLOWED_CHAT_IDS: ${{ secrets.ALLOWED_CHAT_IDS }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          YT_TELEGRAM_BOT_TOKEN: ${{ secrets.YT_TELEGRAM_BOT_TOKEN }}
+          EXPECTED_TELEGRAM_BOT_USERNAME: ${{ vars.EXPECTED_TELEGRAM_BOT_USERNAME }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
@@ -210,7 +65,8 @@ jobs:
       - name: Configure bot commands
         if: inputs.operation == 'setup' && inputs.youtube_url == ''
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          YT_TELEGRAM_BOT_TOKEN: ${{ secrets.YT_TELEGRAM_BOT_TOKEN }}
+          EXPECTED_TELEGRAM_BOT_USERNAME: ${{ vars.EXPECTED_TELEGRAM_BOT_USERNAME }}
         run: ./target/release/yt-tldr setup
 
       - name: Process public test video

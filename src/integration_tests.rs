@@ -25,6 +25,7 @@ const GEMINI: &str = "/models/gemini-fixture:generateContent";
 const GROQ: &str = "/chat/completions";
 const UPDATES: &str = "/botfixture-token/getUpdates";
 const SEND: &str = "/botfixture-token/sendMessage";
+const EDIT: &str = "/botfixture-token/editMessageText";
 
 #[derive(Debug)]
 struct Request {
@@ -276,6 +277,29 @@ fn summary(finish: &str) -> Value {
 fn accepted() -> Step {
     step(SEND, json!({"ok":true,"result":{"message_id":77}}))
 }
+fn progress_accepted() -> Step {
+    step(SEND, json!({"ok":true,"result":{"message_id":55}})).inspect(|request| {
+        assert_eq!(request.body["chat_id"], 42);
+        assert!(
+            request.body["text"]
+                .as_str()
+                .unwrap()
+                .contains("Ссылку получил")
+        );
+    })
+}
+fn progress_edit(fragment: &'static str) -> Step {
+    step(EDIT, json!({"ok":true,"result":{"message_id":55}})).inspect(move |request| {
+        assert_eq!(request.body["chat_id"], 42);
+        assert_eq!(request.body["message_id"], 55);
+        assert!(request.body["text"].as_str().unwrap().contains(fragment));
+    })
+}
+fn fixture_state() -> State {
+    let mut state = State::default();
+    state.bind_bot(123456789).unwrap();
+    state
+}
 fn cfg(directory: &tempfile::TempDir) -> Config {
     Config::fixture(directory.path().join("state.json").to_str().unwrap().into())
 }
@@ -296,18 +320,22 @@ fn real_http_chain_checkpoints_before_send_and_restart_never_duplicates() {
     let checkpoint_path = cfg.state_path.clone();
     let fixture = Fixture::new(vec![
         updates().inspect(|request| assert_eq!(request.body["offset"], 0)),
+        progress_accepted(),
+        progress_edit("расшифровку"),
         step(GEMINI, transcript("STOP")).inspect(|request| {
             assert_eq!(
                 request.body["contents"][0]["parts"][0]["file_data"]["file_uri"],
                 VIDEO
             );
         }),
+        progress_edit("Готовлю саммари"),
         step(GROQ, summary("stop")).inspect(|request| {
             assert_eq!(
                 request.body["messages"][1]["content"],
                 "A private spoken transcript about elephants."
             );
         }),
+        progress_edit("Отправляю результат"),
         accepted().inspect(move |request| {
             assert_eq!(request.body["chat_id"], 42);
             assert!(
@@ -329,11 +357,12 @@ fn real_http_chain_checkpoints_before_send_and_restart_never_duplicates() {
                 assert!(!raw.contains(private));
             }
         }),
+        progress_edit("Готово"),
         empty_updates().inspect(|request| assert_eq!(request.body["offset"], 101)),
         updates().inspect(|request| assert_eq!(request.body["offset"], 101)),
         empty_updates(),
     ]);
-    let mut state = State::default();
+    let mut state = fixture_state();
     assert_eq!(poll(&cfg, &fixture, &mut state).unwrap(), 1);
     let mut restored = State::load(&cfg.state_path).unwrap();
     assert_eq!(restored.update_offset, 101);
@@ -345,7 +374,7 @@ fn real_http_chain_checkpoints_before_send_and_restart_never_duplicates() {
             .iter()
             .filter(|request| request.path == SEND)
             .count(),
-        1
+        2
     );
     assert_eq!(
         requests
@@ -361,11 +390,15 @@ fn confirmed_telegram_throttle_is_durable_and_can_retry_without_an_ambiguous_int
     let directory = tempfile::tempdir().unwrap();
     let cfg = cfg(&directory);
     let fixture = Fixture::new(vec![
-        updates(), step(GEMINI, transcript("STOP")), step(GROQ, summary("stop")),
+        updates(), progress_accepted(), progress_edit("расшифровку"),
+        step(GEMINI, transcript("STOP")), progress_edit("Готовлю саммари"),
+        step(GROQ, summary("stop")), progress_edit("Отправляю результат"),
         step(SEND, json!({"ok":false,"error_code":429,"parameters":{"retry_after":60},"description":"private response"})).status(429),
-        updates(), step(GEMINI, transcript("STOP")), step(GROQ, summary("stop")), accepted(), empty_updates(),
+        updates(), progress_edit("расшифровку"), step(GEMINI, transcript("STOP")),
+        progress_edit("Готовлю саммари"), step(GROQ, summary("stop")),
+        progress_edit("Отправляю результат"), accepted(), progress_edit("Готово"), empty_updates(),
     ]);
-    let mut state = State::default();
+    let mut state = fixture_state();
     let error = poll(&cfg, &fixture, &mut state).unwrap_err();
     assert!(error.is::<telegram::TelegramRejection>());
     let mut state = State::load(&cfg.state_path).unwrap();
@@ -374,6 +407,7 @@ fn confirmed_telegram_throttle_is_durable_and_can_retry_without_an_ambiguous_int
     assert_eq!(poll(&cfg, &fixture, &mut state).unwrap(), 0);
     // Advance the fixture's persisted clock boundary without a real minute wait.
     state.pending.as_mut().unwrap().retry_not_before = Some(unix_time().saturating_sub(1));
+    state.telegram_retry_not_before = Some(unix_time().saturating_sub(1));
     state.write_local(&cfg.state_path).unwrap();
     assert_eq!(poll(&cfg, &fixture, &mut state).unwrap(), 1);
     assert_eq!(state.update_offset, 101);
@@ -386,17 +420,23 @@ fn confirmed_forbidden_chat_does_not_poison_the_following_poll() {
     let cfg = cfg(&directory);
     let fixture = Fixture::new(vec![
         updates(),
+        progress_accepted(),
+        progress_edit("расшифровку"),
         step(GEMINI, transcript("STOP")),
+        progress_edit("Готовлю саммари"),
         step(GROQ, summary("stop")),
+        progress_edit("Отправляю результат"),
         step(
             SEND,
             json!({"ok":false,"error_code":403,"description":"private response"}),
         )
         .status(403),
+        progress_edit("Telegram отклонил"),
+        empty_updates().inspect(|request| assert_eq!(request.body["offset"], 101)),
         empty_updates().inspect(|request| assert_eq!(request.body["offset"], 101)),
     ]);
-    let mut state = State::default();
-    assert!(poll(&cfg, &fixture, &mut state).is_err());
+    let mut state = fixture_state();
+    assert_eq!(poll(&cfg, &fixture, &mut state).unwrap(), 1);
     let mut state = State::load(&cfg.state_path).unwrap();
     assert!(state.pending.is_none());
     assert_eq!(state.update_offset, 101);
@@ -410,11 +450,17 @@ fn lost_telegram_ack_keeps_the_durable_intent_and_blocks_a_duplicate_on_restart(
     let cfg = cfg(&directory);
     let fixture = Fixture::new(vec![
         updates(),
+        progress_accepted(),
+        progress_edit("расшифровку"),
         step(GEMINI, transcript("STOP")),
+        progress_edit("Готовлю саммари"),
         step(GROQ, summary("stop")),
+        progress_edit("Отправляю результат"),
         accepted().disconnect(),
+        progress_edit("Автоповтор остановлен"),
+        updates(),
     ]);
-    let mut state = State::default();
+    let mut state = fixture_state();
     assert!(poll(&cfg, &fixture, &mut state).is_err());
     let mut state = State::load(&cfg.state_path).unwrap();
     assert!(state.pending.as_ref().unwrap().awaiting_ack);
@@ -427,7 +473,7 @@ fn lost_telegram_ack_keeps_the_durable_intent_and_blocks_a_duplicate_on_restart(
             .iter()
             .filter(|request| request.path == SEND)
             .count(),
-        1
+        2
     );
 }
 
@@ -436,6 +482,7 @@ fn provider_retries_cover_real_http_503_and_429_and_process_needs_no_telegram() 
     let directory = tempfile::tempdir().unwrap();
     let mut cfg = cfg(&directory);
     cfg.telegram_token = None;
+    cfg.expected_telegram_bot_username = None;
     let fixture = Fixture::new(vec![
         step(
             GEMINI,
@@ -484,6 +531,7 @@ fn interrupted_provider_bodies_retry_gemini_and_groq_through_process_video() {
     let directory = tempfile::tempdir().unwrap();
     let mut cfg = cfg(&directory);
     cfg.telegram_token = None;
+    cfg.expected_telegram_bot_username = None;
     let fixture = Fixture::new(vec![
         step(GEMINI, transcript("STOP")).interrupted_body(),
         step(GEMINI, transcript("STOP")),
@@ -506,13 +554,16 @@ fn interrupted_provider_bodies_exhaust_bounded_retries_without_terminal_delivery
     let cfg = cfg(&directory);
     let fixture = Fixture::new(vec![
         updates(),
+        progress_accepted(),
+        progress_edit("расшифровку"),
         step(GEMINI, transcript("STOP")).interrupted_body(),
         step(GEMINI, transcript("STOP")).interrupted_body(),
         step(GEMINI, transcript("STOP")).interrupted_body(),
+        progress_edit("Повторю автоматически"),
     ]);
-    let mut state = State::default();
+    let mut state = fixture_state();
     let error = poll(&cfg, &fixture, &mut state).unwrap_err();
-    assert!(error.to_string().contains("temporary provider failure"));
+    assert!(error.is::<crate::runner::RetryLater>());
     let state = State::load(&cfg.state_path).unwrap();
     assert_eq!(state.update_offset, 0);
     assert!(!state.is_processed("42:7"));
@@ -529,10 +580,13 @@ fn interrupted_provider_bodies_exhaust_bounded_retries_without_terminal_delivery
             .count(),
         3
     );
-    assert!(
-        !requests
+    assert!(!requests.iter().any(|request| request.path == GROQ));
+    assert_eq!(
+        requests
             .iter()
-            .any(|request| request.path == GROQ || request.path == SEND)
+            .filter(|request| request.path == SEND)
+            .count(),
+        1
     );
 }
 
@@ -565,11 +619,15 @@ fn provider_long_retry_after_survives_restart_without_spending_another_attempt()
     let cfg = cfg(&directory);
     let fixture = Fixture::new(vec![
         updates(),
+        progress_accepted(),
+        progress_edit("расшифровку"),
         step(GEMINI, json!({"error":"busy"}))
             .status(503)
             .retry_after(3600),
+        progress_edit("Повторю автоматически"),
+        updates(),
     ]);
-    let mut state = State::default();
+    let mut state = fixture_state();
     assert!(poll(&cfg, &fixture, &mut state).is_err());
     let mut state = State::load(&cfg.state_path).unwrap();
     assert!(state.pending.as_ref().unwrap().retry_not_before.unwrap() >= unix_time() + 3599);
@@ -654,7 +712,7 @@ fn doctor_only_reads_bot_webhook_and_model_metadata() {
     let directory = tempfile::tempdir().unwrap();
     let cfg = cfg(&directory);
     let fixture = Fixture::new(vec![
-        step("/botfixture-token/getMe", json!({"ok":true,"result":{"is_bot":true,"username":"fixture_bot"}})),
+        step("/botfixture-token/getMe", json!({"ok":true,"result":{"id":123456789,"is_bot":true,"username":"fixture_bot"}})),
         step("/botfixture-token/getWebhookInfo", json!({"ok":true,"result":{"url":""}})),
         step("/models/gemini-fixture", json!({"name":"models/gemini-fixture","supportedGenerationMethods":["generateContent"]})).get(),
         step("/groq/models", json!({"object":"list","data":[
@@ -722,7 +780,7 @@ fn doctor_rejects_an_active_webhook_without_mutating_it_or_printing_its_url() {
     let fixture = Fixture::new(vec![
         step(
             "/botfixture-token/getMe",
-            json!({"ok":true,"result":{"is_bot":true,"username":"fixture_bot"}}),
+            json!({"ok":true,"result":{"id":123456789,"is_bot":true,"username":"fixture_bot"}}),
         ),
         step(
             "/botfixture-token/getWebhookInfo",
@@ -736,15 +794,24 @@ fn doctor_rejects_an_active_webhook_without_mutating_it_or_printing_its_url() {
 }
 
 #[test]
-fn setup_requires_only_the_telegram_token() {
+fn setup_verifies_the_dedicated_bot_without_requiring_provider_keys() {
     let directory = tempfile::tempdir().unwrap();
     let mut cfg = cfg(&directory);
     cfg.gemini_key = None;
     cfg.groq_key = None;
-    let fixture = Fixture::new(vec![step(
-        "/botfixture-token/setMyCommands",
-        json!({"ok":true,"result":true}),
-    )]);
+    let fixture = Fixture::new(vec![
+        step(
+            "/botfixture-token/getMe",
+            json!({"ok":true,"result":{"id":123456789,"is_bot":true,"username":"fixture_bot"}}),
+        ),
+        step(
+            "/botfixture-token/setMyCommands",
+            json!({"ok":true,"result":true}),
+        )
+        .inspect(|request| {
+            assert_eq!(request.body["commands"][2]["command"], "status");
+        }),
+    ]);
     telegram::setup_commands(&cfg, &fixture.services, &Budget::new(POLL_BUDGET)).unwrap();
     fixture.finish();
 }
@@ -754,7 +821,7 @@ fn exhausted_poll_budget_does_not_fetch_or_acknowledge_updates() {
     let directory = tempfile::tempdir().unwrap();
     let cfg = cfg(&directory);
     let fixture = Fixture::new(vec![]);
-    let mut state = State::default();
+    let mut state = fixture_state();
     assert_eq!(
         app::poll_with_checkpoint(
             &cfg,
@@ -776,7 +843,7 @@ fn provider_budget_exhaustion_retains_the_update_without_a_terminal_failure_repl
     let cfg = cfg(&directory);
     let expired = Fixture::new(vec![]);
     let update: telegram::Update = serde_json::from_value(update()).unwrap();
-    let mut state = State::default();
+    let mut state = fixture_state();
     let error = crate::runner::process_update(
         &mut state,
         &update,
@@ -806,3 +873,6 @@ fn provider_budget_exhaustion_retains_the_update_without_a_terminal_failure_repl
     assert_eq!(state.update_offset, 101);
     retry.finish();
 }
+
+#[path = "progress_tests.rs"]
+mod progress_tests;

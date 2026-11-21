@@ -24,6 +24,17 @@ pub struct Message {
     pub message_id: i64,
     pub chat: Chat,
     pub text: Option<String>,
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+impl Message {
+    pub fn input_text(&self) -> &str {
+        self.text
+            .as_deref()
+            .or(self.caption.as_deref())
+            .unwrap_or("")
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -84,10 +95,60 @@ pub struct SendReceipt {
 }
 
 pub struct DoctorReport {
+    pub id: i64,
     pub username: String,
 }
 
+pub struct BotIdentity {
+    pub id: i64,
+    pub username: String,
+}
+
+#[derive(Debug)]
+pub struct TelegramTransport {
+    pub timeout: bool,
+    pub connect: bool,
+    pub body: bool,
+}
+
+impl std::fmt::Display for TelegramTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Telegram transport failure: timeout={} connect={} body={}",
+            self.timeout, self.connect, self.body
+        )
+    }
+}
+
+impl std::error::Error for TelegramTransport {}
+
+#[derive(Debug)]
+pub struct TelegramServerFailure(pub u16);
+impl std::fmt::Display for TelegramServerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Telegram server HTTP {}", self.0)
+    }
+}
+impl std::error::Error for TelegramServerFailure {}
+
+#[derive(Debug)]
+pub struct TelegramReadTransient(pub u16);
+impl std::fmt::Display for TelegramReadTransient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Telegram update read temporarily failed: HTTP {}",
+            self.0
+        )
+    }
+}
+impl std::error::Error for TelegramReadTransient {}
+
 fn decode<T: DeserializeOwned>(status: StatusCode, body: &[u8]) -> Result<T> {
+    if status.is_server_error() {
+        return Err(TelegramServerFailure(status.as_u16()).into());
+    }
     // Neither the response body nor description belongs in logs: Telegram can
     // include supplied text in errors. Decode errors are deliberately static.
     let response: TgResponse<T> = serde_json::from_slice(body)
@@ -134,17 +195,35 @@ fn call<T: DeserializeOwned>(
         .send()
         .map_err(|error| {
             // Drop the complete reqwest error, including its URL and sources.
-            anyhow::anyhow!(
-                "Telegram transport failure: timeout={} connect={}",
-                error.is_timeout(),
-                error.is_connect()
-            )
+            TelegramTransport {
+                timeout: error.is_timeout(),
+                connect: error.is_connect(),
+                body: false,
+            }
         })?;
     let status = response.status();
-    let body = response
-        .bytes()
-        .map_err(|_| anyhow::anyhow!("Telegram response body was not received completely"))?;
+    let body = response.bytes().map_err(|error| TelegramTransport {
+        timeout: error.is_timeout(),
+        connect: error.is_connect(),
+        body: true,
+    })?;
     decode(status, &body)
+}
+
+fn read_call<T: DeserializeOwned>(
+    method: &str,
+    token: &str,
+    services: &Services,
+    budget: &Budget,
+    body: serde_json::Value,
+) -> Result<T> {
+    call(method, token, services, budget, body).map_err(|error| {
+        if let Some(server) = error.downcast_ref::<TelegramServerFailure>() {
+            TelegramReadTransient(server.0).into()
+        } else {
+            error
+        }
+    })
 }
 
 pub fn get_updates(
@@ -152,15 +231,20 @@ pub fn get_updates(
     services: &Services,
     budget: &Budget,
     offset: u64,
+    poll_timeout_secs: u32,
 ) -> Result<Vec<Update>> {
-    call(
+    anyhow::ensure!(
+        poll_timeout_secs <= 25,
+        "Telegram poll timeout exceeds the request budget"
+    );
+    read_call(
         "getUpdates",
         cfg.telegram_token()?,
         services,
         budget,
         json!({
             "offset": offset,
-            "timeout": 0,
+            "timeout": poll_timeout_secs,
             "allowed_updates": ["message"],
         }),
     )
@@ -201,6 +285,8 @@ pub fn send_chunk(
 }
 
 pub fn setup_commands(cfg: &Config, services: &Services, budget: &Budget) -> Result<()> {
+    cfg.validate_setup()?;
+    verified_identity(cfg, services, budget)?;
     let configured: bool = call(
         "setMyCommands",
         cfg.telegram_token()?,
@@ -210,6 +296,7 @@ pub fn setup_commands(cfg: &Config, services: &Services, budget: &Budget) -> Res
             "commands": [
                 {"command": "start", "description": "Как пользоваться ботом"},
                 {"command": "help", "description": "Как пользоваться ботом"},
+                {"command": "status", "description": "Состояние обработки"},
             ],
         }),
     )?;
@@ -219,29 +306,12 @@ pub fn setup_commands(cfg: &Config, services: &Services, budget: &Budget) -> Res
 }
 
 pub fn doctor(cfg: &Config, services: &Services, budget: &Budget) -> Result<DoctorReport> {
-    #[derive(Deserialize)]
-    struct Identity {
-        is_bot: bool,
-        username: Option<String>,
-    }
+    let identity = verified_identity(cfg, services, budget)?;
     #[derive(Deserialize)]
     struct WebhookInfo {
         url: String,
     }
-    let identity: Identity = call("getMe", cfg.telegram_token()?, services, budget, json!({}))?;
-    anyhow::ensure!(
-        identity.is_bot,
-        "Telegram credentials do not identify a bot"
-    );
-    let username = identity.username.context("Telegram bot has no username")?;
-    anyhow::ensure!(
-        (5..=32).contains(&username.len())
-            && username
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
-        "Telegram bot returned an invalid username"
-    );
-    let webhook: WebhookInfo = call(
+    let webhook: WebhookInfo = read_call(
         "getWebhookInfo",
         cfg.telegram_token()?,
         services,
@@ -252,7 +322,65 @@ pub fn doctor(cfg: &Config, services: &Services, budget: &Budget) -> Result<Doct
         webhook.url.is_empty(),
         "Telegram webhook is active; polling cannot start"
     );
-    Ok(DoctorReport { username })
+    Ok(DoctorReport {
+        id: identity.id,
+        username: identity.username,
+    })
+}
+
+pub fn verified_identity(
+    cfg: &Config,
+    services: &Services,
+    budget: &Budget,
+) -> Result<BotIdentity> {
+    cfg.validate_setup()?;
+    #[derive(Deserialize)]
+    struct Identity {
+        id: i64,
+        is_bot: bool,
+        username: Option<String>,
+    }
+    let identity: Identity =
+        read_call("getMe", cfg.telegram_token()?, services, budget, json!({}))?;
+    anyhow::ensure!(
+        identity.is_bot && identity.id > 0,
+        "Telegram credentials do not identify a bot"
+    );
+    let username = identity.username.context("Telegram bot has no username")?;
+    anyhow::ensure!(
+        (5..=32).contains(&username.len())
+            && username
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+        "Telegram bot returned an invalid username"
+    );
+    cfg.validate_bot_identity(&username)?;
+    Ok(BotIdentity {
+        id: identity.id,
+        username,
+    })
+}
+
+pub fn edit_progress(
+    cfg: &Config,
+    services: &Services,
+    budget: &Budget,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) -> Result<()> {
+    let receipt: SendReceipt = call(
+        "editMessageText",
+        cfg.telegram_token()?,
+        services,
+        budget,
+        json!({"chat_id":chat_id,"message_id":message_id,"text":text,"link_preview_options":{"is_disabled":true}}),
+    )?;
+    anyhow::ensure!(
+        receipt.message_id == message_id,
+        "Telegram returned an invalid edited-message receipt"
+    );
+    Ok(())
 }
 
 /// Режем по строкам (падения на границе абзаца приятнее глазу), длинные строки — принудительно.

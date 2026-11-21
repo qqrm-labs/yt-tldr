@@ -1,27 +1,37 @@
 # Repository Agent Instructions
 
 ## What this is
-Telegram bot: a YouTube link in, a summary with key takeaways out. Fully serverless —
-logic runs in GitHub Actions ("Run Bot", cron */5), persistent state lives on the
-`bot-state` branch (`data/bot-state.json`), same pattern as weekly-gh-digest.
+Rust Telegram bot: a YouTube link in, progress and a summary with key takeaways out.
+Production uses one persistent `serve` process with long polling and private local
+state. GitHub Actions runs CI, readiness, menu setup and public video diagnostics;
+it must not be turned into a self-restarting permanent bot host.
 
-## Pipeline
-getUpdates drain → extract YouTube URL → Gemini free tier (native YouTube URL
-understanding, no video download) → transcript → Groq (`openai/gpt-oss-120b`) →
-TL;DR + takeaways → sendMessage. The binary synchronously checkpoints metadata to `delivery-state` through the workflow-provided
-helper. The workflow retains `bot-state` as an archive; it is not the send durability boundary.
+## Pipeline and identity
+getUpdates → accepted status → Gemini transcription → Groq summary → final reply.
+Progress edits are best effort; confirmed result delivery has a separate durable
+intent and cursor. Never acknowledge Telegram input before delivery is resolved.
+The dedicated token is `YT_TELEGRAM_BOT_TOKEN` and the expected username is
+`EXPECTED_TELEGRAM_BOT_USERNAME`. Do not fall back to the digest bot's old token.
+State is bound to bot identity. Never copy offsets across bots or reset state to
+recover from ambiguous delivery. Historical `delivery-state` and `bot-state`
+branches belong to the retired Actions worker and remain available for recovery.
 
 ## Validation loop
 - `cargo fmt --all -- --check`
-- `cargo check --tests`
-- `cargo clippy --all-targets -- -D warnings`
-- `cargo test`
+- `cargo check --locked --tests`
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo test --locked`
 
-## Workflow rules
+## Deployment and workflow rules
 - Never bypass failing checks on `main`.
-- Keep secrets only in GitHub Actions secrets (TELEGRAM_BOT_TOKEN, GEMINI_API_KEY,
-  GROQ_API_KEY); model names go to repo variables (GEMINI_MODEL, GROQ_MODEL).
-- Actions are pinned by commit SHA with a version comment — keep it that way
-  (workflow-security.yml runs actionlint + zizmor on every change).
-- The `process <url>` subcommand is the manual test path: it must never need
-  TELEGRAM_BOT_TOKEN.
+- Keep credentials in GitHub Actions secrets or the deployment host's private
+  environment file. Never log, commit or extract secret values.
+- Model names and expected bot username are non-secret configuration. In Actions
+  they belong in repository variables.
+- Public state/logs must not contain chat IDs, input text, video URLs, transcripts,
+  generated replies or tokens. Fixture data is synthetic.
+- Actions are pinned by commit SHA with a version comment; retain that convention.
+- `process <url>` must never require a Telegram token.
+- Automated tests use local fixtures; they never send Telegram messages.
+- A real deployment is verified by receipt, progress, result and restart without
+  duplicate delivery. Green CI or an empty queue does not establish that result.

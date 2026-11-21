@@ -3,7 +3,7 @@ name = "yt-tldr"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Telegram bot: throw a YouTube link at it, get back a summary with the key takeaways (GitHub Actions serverless)"
+description = "Telegram bot: a YouTube link in, progress and key takeaways out"
 
 [dependencies]
 anyhow = "1"
