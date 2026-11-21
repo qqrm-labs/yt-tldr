@@ -1,158 +1,182 @@
 # yt-tldr
 
-Telegram-бот: кидаешь ссылку на YouTube — получаешь саммари с ключевыми тейками.
-Логика выполняется в GitHub Actions: Telegram → YouTube → транскрипция Gemini →
-саммари Groq → ответ в Telegram. Отдельный сервер не нужен.
+Telegram-бот для публичных YouTube-видео: ссылка → транскрипция Gemini → саммари
+Groq → ответ с ключевыми выводами. Бот подтверждает получение ссылки, показывает
+этап обработки и сообщает о временной или окончательной ошибке.
 
-Это асинхронный бот: `schedule` запрашивает запуск каждые пять минут, но GitHub может
-задерживать или пропускать такие запуски. Обещания ответа за 0–10 минут нет.
-Для обработки очереди сейчас доступен ручной `Run Bot` с `operation=poll`.
-Постоянно доступному боту с быстрым ответом нужен отдельный runtime или webhook.
+## Что видит пользователь
 
-Авторитетное состояние доставки хранится в `delivery-state`; `bot-state` содержит архив.
+- После получения ссылки worker отправляет короткое подтверждение до обращения к AI.
+- Одно сообщение состояния обновляется по этапам: содержание видео, саммари,
+  ожидание повтора, завершение. Проценты и выдуманный срок готовности не показываются.
+- Результат отправляется отдельно. «Готово» означает подтверждённую Telegram доставку
+  всех частей ответа.
+- Неподходящее сообщение получает подсказку. `/start` и `/help` объясняют формат,
+  `/status` показывает доступное состояние обработки.
+- Если AI временно недоступен, бот сообщает о повторе; после исчерпания попыток
+  отправляет понятную ошибку. Неоднозначная доставка результата требует проверки
+  оператором, чтобы не отправить дубликат.
 
-## Почему так
+Подтверждение возможно только у работающего worker. Основной режим — постоянный
+`serve` с Telegram long polling. Обработка видео последовательная; команда `/status`
+не прерывает уже выполняющийся блокирующий запрос к AI. Статус отражает последний
+достигнутый этап, а не гарантию исправности всех внешних сервисов.
 
-- **Транскрипция — Gemini, не Яндекс.** Yandex SpeechKit требует биллинг-аккаунт с картой,
-  а Gemini бесплатного тира принимает ссылку на YouTube **напрямую** и сам отдаёт транскрипт —
-  это и есть «гугловая транскрипция», причём без скачивания видео: yt-dlp с IP раннеров
-  Actions YouTube регулярно блокирует.
-- **Саммари — Groq** (`openai/gpt-oss-120b` по умолчанию): free tier, паттерн проверен на
-  [weekly-gh-digest](../weekly-gh-digest).
-- **Репо публичное:** ключи хранятся только в GitHub Actions secrets. Состояние доставки
-  содержит метаданные, а не пользовательский текст, chat IDs или сгенерированные ответы.
-  Ручная проверка видео выводит саммари в публичный summary запуска: для неё
-  используйте только публичный тестовый материал.
+**GitHub Actions больше не опрашивает Telegram по расписанию.** Раньше `*/5`
+фактически давал многочасовые перерывы. GitHub прямо допускает задержки и пропуски
+[scheduled workflows](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+Actions оставлен для CI, проверки конфигурации, меню и публичного тестового видео.
 
-## Лимиты бесплатных тиров
+## Отдельный Telegram-бот
 
-- Доступность моделей и бесплатные квоты зависят от аккаунта провайдера. Наличие ключа
-  не доказывает, что обработка конкретного видео доступна: это проверяется отдельным
-  запуском `process`.
-- Длинные видео могут не поместиться в лимиты транскрипции или саммари. Обрезание
-  отмечается в итоговом ответе; полный дословный транскрипт не гарантируется.
-- Временные ошибки провайдеров повторяются ограниченное число раз. Ошибка настройки,
-  недоступная модель или исчерпание попыток видны в журнале с названием этапа.
+YouTube-бот должен иметь собственный токен. Токен `@github_weekly_digest_bot`
+здесь не используется. Старый `TELEGRAM_BOT_TOKEN` не служит fallback.
 
-## Setup (один раз)
+1. Создать отдельного бота через [@BotFather](https://t.me/BotFather), `/newbot`.
+2. Сохранить его токен в `YT_TELEGRAM_BOT_TOKEN`, а точный username без `@` —
+   в `EXPECTED_TELEGRAM_BOT_USERNAME`.
+3. Задать `ALLOWED_CHAT_IDS`: разрешённые chat IDs через запятую, без `*`.
+4. Добавить `GEMINI_API_KEY` и `GROQ_API_KEY`.
 
-1. [@BotFather](https://t.me/BotFather) → `/newbot` → получить токен.
-2. [aistudio.google.com/apikey](https://aistudio.google.com/apikey) → ключ Gemini (без карты).
-3. Ключ Groq (console.groq.com) — можно тот же, что использует weekly-gh-digest.
-4. Залить секреты:
-   ```sh
-   gh secret set -R qqrm/yt-tldr TELEGRAM_BOT_TOKEN
-   gh secret set -R qqrm/yt-tldr GEMINI_API_KEY
-   gh secret set -R qqrm/yt-tldr GROQ_API_KEY
-   gh secret set -R qqrm/yt-tldr ALLOWED_CHAT_IDS
-   ```
-   `ALLOWED_CHAT_IDS` — явный список разрешённых chat IDs через запятую, без `*`.
-   Модели (опционально) — в repo variables `GEMINI_MODEL` / `GROQ_MODEL`.
-5. Проверить настройки, токен и отсутствие конфликтующего webhook:
-   ```sh
-   gh workflow run -R qqrm/yt-tldr "Run Bot" -f operation=check
-   ```
-   Summary покажет имя и ссылку бота, а также число разрешённых чатов. Проверка не
-   забирает входящие сообщения и не отправляет ответов.
-6. Настроить меню `/start` и `/help`:
-   ```sh
-   gh workflow run -R qqrm/yt-tldr "Run Bot" -f operation=setup
-   ```
-7. В разрешённом личном чате открыть ссылку бота, нажать **Start** и отправить YouTube URL.
-   Дождаться следующего запуска или обработать очередь явно:
-   ```sh
-   gh workflow run -R qqrm/yt-tldr "Run Bot" -f operation=poll
-   ```
+Перед чтением очереди и настройкой меню приложение проверяет `getMe` и ожидаемого
+бота. Состояние привязано к bot identity. Смена токена того же бота сохраняет очередь;
+другому боту нужен новый файл состояния. Старые offset и pending от digest-бота
+автоматически не переносятся и не обнуляются.
 
-Ручной запуск без параметров выполняет `check`. Плановый запуск выполняет `poll`.
-Polling требует Telegram token, allowlist и оба ключа провайдеров; неполная настройка
-завершает запуск ошибкой, а не зелёным пропуском.
+Модели по умолчанию: `gemini-3.1-flash-lite` и `openai/gpt-oss-120b`.
+Их можно переопределить через `GEMINI_MODEL` и `GROQ_MODEL`.
+Проверка метаданных модели не доказывает успешную обработку конкретного видео:
+доступность и квоты зависят от провайдера и аккаунта.
 
-## Как проверить обработку видео
+## Постоянный запуск на Linux
 
-Один короткий публичный пример, без Telegram и без изменения веток состояния:
+Нужен постоянно включённый хост с исходящим HTTPS. Входящий публичный порт,
+домен и webhook для long polling не требуются. Использовать один worker на токен.
+Файлы для systemd находятся в [`deploy/`](deploy/).
+
+Собрать release на целевом Linux-хосте из проверенного commit:
 
 ```sh
-gh workflow run -R qqrm/yt-tldr "Run Bot" \
-  -f youtube_url='https://www.youtube.com/watch?v=jNQXAC9IVRw'
+cargo build --release --locked
+sudo useradd --system --user-group --home-dir /var/lib/yt-tldr --shell /usr/sbin/nologin yt-tldr
+sudo install -m 0755 target/release/yt-tldr /usr/local/bin/yt-tldr
+sudo install -m 0644 deploy/yt-tldr.service /etc/systemd/system/yt-tldr.service
+sudo install -m 0600 deploy/yt-tldr.env.example /etc/yt-tldr.env
+sudoedit /etc/yt-tldr.env
+sudo systemctl daemon-reload
+sudo systemctl enable --now yt-tldr.service
+sudo systemctl status yt-tldr.service
+sudo journalctl -u yt-tldr.service -n 50 --no-pager
 ```
 
-Этот режим реально вызывает Gemini и Groq и публикует результат в summary запуска.
-Он подтверждает только обработку видео. Полный сценарий подтверждается отдельным
-входящим сообщением в Telegram, успешным `sendMessage` с receipt и следующим polling
-без повторной отправки. Зелёный polling с пустой очередью этого не доказывает.
+`useradd` нужен только при первой установке; существующий заполненный env-файл
+не заменять примером. Секреты вводятся в приватный `/etc/yt-tldr.env`, не в git
+и не в команды с аргументами. GitHub secrets нельзя прочитать обратно для установки
+на хост: нужные значения задаются владельцем из исходного хранилища секретов.
 
-## Локально
+Unit создаёт `/var/lib/yt-tldr` с правами `0700`. `serve` и диагностический `poll`
+требуют абсолютный `STATE_PATH`, приватный каталог и durable локальное состояние.
+Второй процесс с тем же файлом состояния отклоняется блокировкой. Разные хосты
+не разделяют эту блокировку: не запускать несколько экземпляров одного бота.
+
+При обновлении сначала остановить сервис, заменить бинарник, затем запустить его.
+Если процесс остановлен посреди отправки результата, следующий запуск может
+потребовать reconciliation. Автоматический restart не снимает этот запрет.
+Ошибка конфигурации или необходимость reconciliation завершают `serve` с кодом 78;
+unit не перезапускает такой процесс до исправления причины оператором.
+
+### Приёмка развёртывания
+
+1. Проверить правильный username и отсутствие webhook через `doctor`.
+2. Настроить меню через `setup` с тем же приватным окружением.
+3. Запустить `serve`, открыть отдельного бота, нажать **Start** и отправить публичную
+   YouTube-ссылку из разрешённого чата.
+4. Проверить подтверждение **до** обращения к AI, смену этапов, итоговый ответ и
+   запись `delivery_confirmed` в журнале.
+5. Перезапустить сервис и убедиться, что уже доставленный ответ не повторяется.
+
+Успешные CI, `doctor` и обработка видео без Telegram — отдельные проверки.
+Они не заменяют эту приёмку реальным сообщением.
+
+## GitHub Actions: диагностика и меню
+
+В Settings → Secrets and variables → Actions:
+
+| Тип | Имена |
+| --- | --- |
+| Secrets | `YT_TELEGRAM_BOT_TOKEN`, `ALLOWED_CHAT_IDS`, `GEMINI_API_KEY`, `GROQ_API_KEY` |
+| Variables | `EXPECTED_TELEGRAM_BOT_USERNAME`, `GEMINI_MODEL`, `GROQ_MODEL` |
 
 ```sh
-export TELEGRAM_BOT_TOKEN=... GEMINI_API_KEY=... GROQ_API_KEY=...
-cargo run -- process 'https://youtu.be/...'   # без Telegram, саммари в stdout
-export ALLOWED_CHAT_IDS=...
-cargo run -- doctor                          # проверка готовности без сообщений
-cargo run -- poll                             # один цикл опроса Telegram
-cargo run -- setup                            # setMyCommands
+gh workflow run -R qqrm/yt-tldr 'Run Bot' -f operation=check
+gh workflow run -R qqrm/yt-tldr 'Run Bot' -f operation=setup
 ```
 
-## Файлы
+`check` читает метаданные, `setup` устанавливает команды именно отдельного бота.
+Они не читают очередь входящих сообщений. Значение по умолчанию — `check`.
 
-- `src/` — Rust: `main.rs` (poll/process), `gemini.rs` (транскрипт), `groq.rs` (саммари),
-  `telegram.rs` (Bot API), `state.rs`, `youtube.rs`.
-- `.github/workflows/run-bot.yml` — прод-пайплайн (cron + ручной тест с `youtube_url`).
-- `.github/workflows/ci.yml`, `workflow-security.yml` — fmt/clippy/test, actionlint/zizmor.
-- Ветка `delivery-state` — авторитетный checkpoint; `bot-state` — архив.
+Проверка одного короткого публичного видео без Telegram:
 
-## Идеи на потом
+```sh
+gh workflow run -R qqrm/yt-tldr 'Run Bot' -f youtube_url='https://www.youtube.com/watch?v=jNQXAC9IVRw'
+```
 
-- Webhook через Cloudflare Worker (бесплатно) → мгновенная реакция вместо cron.
-- Long-poll режим: один job на несколько часов → ответ за секунды.
-- Выбор языка саммари командой бота.
+Саммари попадает в **публичный** summary запуска. Использовать только публичный
+тестовый материал. Telegram-токен и ветки состояния этому режиму не нужны.
 
-## Durable delivery and recovery
+## CLI и проверка кода
 
-The workflow restores the existing `bot-state` source archive, then overlays the authoritative
-`delivery-state/yt-tldr.json` checkpoint. On first use, it migrates the existing state; an
-existing archive without its expected state file is an error. Every provider reservation,
-pre-send intent, and acknowledged cursor is committed synchronously with the GitHub Contents
-API using compare-and-swap. A stale writer, transport error, or missing restore receipt stops
-processing. The final archive push is no longer the durability boundary.
+```sh
+cargo run -- process 'https://www.youtube.com/watch?v=jNQXAC9IVRw'
+cargo run -- doctor
+cargo run -- setup
+cargo run -- poll    # один диагностический цикл; остановить serve перед запуском
+cargo run -- serve   # постоянный worker, вне GitHub Actions
+```
 
-The public checkpoint contains only update IDs, attempt counts, delivery cursors, fingerprints,
-and `awaiting_ack`; user text, chat IDs, generated replies, and tokens are never serialized.
-If Telegram times out or the runner dies after the intent was stored, the next run stops with
-`operator reconciliation required` instead of automatically sending a possible duplicate.
-Telegram does not support an idempotency key, so exactly-once delivery is not claimed.
+Окружение с секретами загрузить приватно заранее. `process` требует только ключи
+Gemini/Groq. `poll` и `serve` требуют отдельного Telegram-бота, allowlist и абсолютный
+`STATE_PATH` в приватном каталоге.
 
-A structured Telegram rejection is distinct from an unknown delivery outcome. A confirmed
-429 retains the update with its retry time; a confirmed terminal 400/403 is reported as a
-delivery failure without blocking unrelated updates. A missing or malformed acknowledgement
-still requires reconciliation. Partial replies are regenerated after a restart and must match
-the stored fingerprint; reply text is deliberately not persisted in this public repository.
+```sh
+cargo fmt --all -- --check
+cargo check --locked --tests
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+```
 
-To reconcile, first stop concurrent runs and save the current checkpoint and its SHA. Inspect
-the destination chat privately. For a proven absent chunk, clear only `pending.awaiting_ack`;
-for a proven delivered chunk, advance `pending.next_chunk` by one and clear that flag. Keep
-all other fields and write with the inspected blob SHA. If delivery cannot be established,
-leave the intent pending. Never clear the checkpoint or reset the update offset to recover.
-An unavailable original Telegram update or changed regenerated reply still requires manual
-reconciliation. Local runs without the remote helper retain local checkpoints only.
+Автотесты используют локальные HTTP fixtures, без production credentials и без
+отправки сообщений в Telegram. Проверяются порядок статусов, ошибки API, checkpoint,
+повторный запуск, отсутствие приватного текста в состоянии и доставка результата.
 
-The production workflow only runs from `main` and uses a repository-wide concurrency group.
-Automated fixture tests use local HTTP fixtures and require no production credentials.
-Manual video checks use the configured provider keys, require no Telegram token, and never
-send Telegram messages. `doctor` reads service metadata; `setup` configures the bot menu.
+## Состояние и восстановление
 
-The checkout never persists its token. Legacy archive fetch/push receives `GH_TOKEN` only in
-its own step and uses a process-scoped Git credential helper; no authentication is written
-to the Git configuration. Dependency builds and caches receive no publication credential.
-The checkpoint helper and bot receive their required credentials only during their runtime steps.
+Состояние содержит только metadata: offset, fingerprints, попытки, этап и receipt
+статуса, курсор частей ответа и флаги подтверждения. Пользовательский текст, chat IDs,
+ссылки, транскрипты, саммари и токены не сериализуются. Исходное входящее сообщение
+сохраняется на стороне Telegram до подтверждения offset, но [не дольше 24 часов](https://core.telegram.org/bots/api#getting-updates).
+После длительного простоя недоступный pending требует ручной проверки.
 
-The checkpoint uses the application's typed JSON state, preserving existing fields and adding
-defaults only for compatible fields. This migration creates its
-single known state key only when `delivery-state` is confirmed absent. A pre-existing branch
-without that key is not an empty installation: it stops for explicit initialization or
-reconciliation. Adding another key later requires an intentional migration, never automatic
-fallback to an empty state. The `bot-state` archive is the initial migration source only;
-subsequent runs always restore the authoritative checkpoint over that archive.
+Перед отправкой результата сохраняется intent; после подтверждённого Telegram
+receipt — следующий курсор. Если результат мог быть отправлен, но receipt не получен,
+приложение останавливается с `operator reconciliation required`. Exactly-once
+доставка не обещается: Telegram не предоставляет ключ идемпотентности `sendMessage`.
+Подтверждённые 429 допускают повтор после паузы, подтверждённые 400/403 не блокируют
+остальные updates. Статусы best effort и не подменяют подтверждение результата.
 
-After migration, use the current workflow from `main`; do not rerun historical jobs from before
-the checkpoint migration, because their old code does not implement this delivery contract.
+Для reconciliation остановить сервис, сохранить копию состояния и приватно
+проверить чат. Для доказанно недоставленной части очистить только
+`pending.awaiting_ack`; для доказанно доставленной — также увеличить
+`pending.next_chunk` на один. Остальные поля сохранить. Если исход нельзя установить,
+оставить intent pending. При частично отправленном ответе повторно сгенерированные
+части должны совпасть с сохранённым fingerprint. Не сбрасывать весь offset ради
+восстановления.
+
+Исторические ветки `delivery-state` и `bot-state` оставлены для старого Actions
+worker. Они относятся к прежнему bot identity. Новый сервис начинает с собственного
+нового приватного файла. Не копировать старую очередь в нового бота и не перезапускать
+старые Actions jobs после перехода на постоянный сервис. Исходный checkpoint helper
+с compare-and-swap сохранён для изучения и восстановления исторического состояния.
+
+Длинные видео и ответы могут достигнуть лимитов моделей. Обрезание отмечается в
+саммари; полный дословный транскрипт не гарантируется.

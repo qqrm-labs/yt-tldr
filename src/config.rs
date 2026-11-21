@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 #[derive(Clone)]
 pub struct Config {
     pub telegram_token: Option<String>,
+    pub expected_telegram_bot_username: Option<String>,
     pub gemini_key: Option<String>,
     pub groq_key: Option<String>,
     pub gemini_model: String,
@@ -21,10 +22,12 @@ fn var(name: &str) -> Option<String> {
 impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            telegram_token: var("TELEGRAM_BOT_TOKEN"),
+            telegram_token: var("YT_TELEGRAM_BOT_TOKEN"),
+            expected_telegram_bot_username: var("EXPECTED_TELEGRAM_BOT_USERNAME"),
             gemini_key: var("GEMINI_API_KEY"),
             groq_key: var("GROQ_API_KEY"),
-            gemini_model: var("GEMINI_MODEL").unwrap_or_else(|| "gemini-3.8-flash".to_string()),
+            gemini_model: var("GEMINI_MODEL")
+                .unwrap_or_else(|| "gemini-3.1-flash-lite".to_string()),
             groq_model: var("GROQ_MODEL").unwrap_or_else(|| "openai/gpt-oss-120b".to_string()),
             state_path: var("STATE_PATH").unwrap_or_else(|| "data/bot-state.json".to_string()),
             allowed_chats: parse_allowlist(var("ALLOWED_CHAT_IDS").as_deref())?,
@@ -34,7 +37,7 @@ impl Config {
     pub fn telegram_token(&self) -> Result<&str> {
         self.telegram_token
             .as_deref()
-            .context("TELEGRAM_BOT_TOKEN не задан")
+            .context("YT_TELEGRAM_BOT_TOKEN не задан")
     }
 
     pub fn gemini_key(&self) -> Result<&str> {
@@ -48,13 +51,52 @@ impl Config {
     }
 
     pub fn validate_poll(&self) -> Result<()> {
-        self.telegram_token()?;
+        self.validate_setup()?;
         self.validate_process()?;
         anyhow::ensure!(
             !self.allowed_chats.is_empty(),
             "ALLOWED_CHAT_IDS is required before polling Telegram"
         );
         Ok(())
+    }
+
+    pub fn validate_setup(&self) -> Result<()> {
+        self.telegram_token()?;
+        let username = self.expected_bot_username()?;
+        anyhow::ensure!(
+            !username.eq_ignore_ascii_case("github_weekly_digest_bot"),
+            "yt-tldr requires a dedicated bot; the weekly digest bot is not allowed"
+        );
+        Ok(())
+    }
+
+    pub fn validate_bot_identity(&self, username: &str) -> Result<()> {
+        self.validate_setup()?;
+        anyhow::ensure!(
+            !username.eq_ignore_ascii_case("github_weekly_digest_bot"),
+            "yt-tldr requires a dedicated bot; the weekly digest bot is not allowed"
+        );
+        anyhow::ensure!(
+            username.eq_ignore_ascii_case(self.expected_bot_username()?),
+            "Telegram bot identity does not match EXPECTED_TELEGRAM_BOT_USERNAME"
+        );
+        Ok(())
+    }
+
+    fn expected_bot_username(&self) -> Result<&str> {
+        let configured = self
+            .expected_telegram_bot_username
+            .as_deref()
+            .context("EXPECTED_TELEGRAM_BOT_USERNAME is required for Telegram operations")?;
+        let username = configured.strip_prefix('@').unwrap_or(configured);
+        anyhow::ensure!(
+            (5..=32).contains(&username.len())
+                && username
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+            "EXPECTED_TELEGRAM_BOT_USERNAME must be a Telegram username"
+        );
+        Ok(username)
     }
 
     pub fn validate_process(&self) -> Result<()> {
@@ -90,6 +132,7 @@ impl Config {
     pub fn fixture(state_path: String) -> Self {
         Self {
             telegram_token: Some("fixture-token".into()),
+            expected_telegram_bot_username: Some("fixture_bot".into()),
             gemini_key: Some("fixture-gemini-key".into()),
             groq_key: Some("fixture-groq-key".into()),
             gemini_model: "gemini-fixture".into(),
@@ -136,6 +179,10 @@ mod tests {
         assert!(cfg.validate_poll().is_err());
         cfg.validate_process().unwrap();
         cfg = original.clone();
+        cfg.expected_telegram_bot_username = None;
+        assert!(cfg.validate_poll().is_err());
+        cfg.validate_process().unwrap();
+        cfg = original.clone();
         cfg.allowed_chats.clear();
         assert!(cfg.validate_poll().is_err());
         cfg = original.clone();
@@ -144,5 +191,36 @@ mod tests {
         cfg = original;
         cfg.groq_key = None;
         assert!(cfg.validate_poll().is_err());
+    }
+
+    #[test]
+    fn telegram_operations_require_the_expected_dedicated_bot() {
+        let mut cfg = Config::fixture("unused.json".into());
+        cfg.expected_telegram_bot_username = Some("@Fixture_Bot".into());
+        cfg.validate_bot_identity("fixture_bot").unwrap();
+        assert!(cfg.validate_bot_identity("another_bot").is_err());
+        assert!(
+            cfg.validate_bot_identity("github_weekly_digest_bot")
+                .is_err()
+        );
+        cfg.expected_telegram_bot_username = Some("GitHub_Weekly_Digest_Bot".into());
+        assert!(cfg.validate_setup().is_err());
+        assert!(
+            cfg.validate_bot_identity("github_weekly_digest_bot")
+                .is_err()
+        );
+        for invalid in ["", "abc", "@@fixture_bot", "fixture/bot", "fixture bot"] {
+            cfg.expected_telegram_bot_username = Some(invalid.into());
+            assert!(cfg.validate_setup().is_err());
+        }
+    }
+
+    #[test]
+    fn menu_setup_does_not_require_provider_credentials() {
+        let mut cfg = Config::fixture("unused.json".into());
+        cfg.gemini_key = None;
+        cfg.groq_key = None;
+        cfg.allowed_chats.clear();
+        cfg.validate_setup().unwrap();
     }
 }

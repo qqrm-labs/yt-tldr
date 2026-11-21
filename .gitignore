@@ -1,5 +1,12 @@
 /target
 
+# Local runtime credentials and private durable state.
+.env
+.env.*
+!*.env.example
+/data/
+.yt-tldr.lock
+
 __pycache__/
 
 # Local receipt is refreshed by the authoritative remote checkpoint restore.
